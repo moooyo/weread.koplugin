@@ -38,11 +38,12 @@ jobs:
       - name: Lua unit and component specs
         run: bash scripts/run_lua_specs.sh
 
-      - name: Python syntax check
+      - name: Python syntax and credential helper tests
         run: |
           if [ -d scripts ]; then
             python3 -m py_compile scripts/*.py
           fi
+          python3 -m unittest discover -s spec -p '*_spec.py'
 
       - name: Release package smoke test
         run: bash scripts/package_release.sh /tmp/weread.koplugin-release-test.zip

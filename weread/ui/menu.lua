@@ -339,6 +339,33 @@ function M:getSettingsMenuItems()
             sub_item_table_func = function()
                 return {
                     {
+                        text_func = function()
+                            return T(_("Concurrent chapter downloads: %1"),
+                                tostring(self:getChapterDownloadConcurrency()))
+                        end,
+                        help_text = _("Changes apply to new download jobs."),
+                        sub_item_table_func = function()
+                            local items = {}
+                            for value = 1, 5 do
+                                local concurrency = value
+                                local label = T(_("%1 chapter(s)"), tostring(concurrency))
+                                items[#items + 1] = {
+                                    text = label,
+                                    keep_menu_open = true,
+                                    check_callback_updates_menu = true,
+                                    checked_func = function()
+                                        return self:getChapterDownloadConcurrency() == concurrency
+                                    end,
+                                    callback = self:safeCallback(label, function(touchmenu_instance)
+                                        self:setChapterDownloadConcurrency(concurrency)
+                                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    end),
+                                }
+                            end
+                            return items
+                        end,
+                    },
+                    {
                         text = _("Book images"),
                         keep_menu_open = true,
                         checked_func = function()

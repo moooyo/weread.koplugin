@@ -1,6 +1,7 @@
 local DataStorage = require("datastorage")
 local BookStore = require("weread.lib.book_store")
 local Cookie = require("weread.lib.cookie")
+local DownloadPolicy = require("weread.lib.download_policy")
 local LuaSettings = require("luasettings")
 local lfs = require("libs/libkoreader-lfs")
 
@@ -30,6 +31,7 @@ local defaults = {
     },
     cache = {
         download_book_images = true,
+        chapter_download_concurrency = 5,
         download_mp_images = false,
         book_footnotes_in_popup = false,
         download_underlines_and_thoughts = false,
@@ -138,6 +140,11 @@ function Settings:new()
     local cache_changed = false
     if cache.download_book_images == nil then
         cache.download_book_images = cache.download_images ~= false
+        cache_changed = true
+    end
+    local concurrency = DownloadPolicy.concurrency(cache.chapter_download_concurrency)
+    if cache.chapter_download_concurrency ~= concurrency then
+        cache.chapter_download_concurrency = concurrency
         cache_changed = true
     end
     if cache.download_mp_images == nil then

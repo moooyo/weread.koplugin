@@ -272,17 +272,24 @@ local BLOCK_TAGS = { "aside", "li", "p", "div", "section", "blockquote", "dd", "
 -- far larger.
 local MAX_NOTE_TEXT_BYTES = 6000
 
-local function remember_definition(definitions, anchor, inner)
-    if not anchor or anchor == "" then return end
-    local text = clean_note_text(inner)
-    if text == "" or is_trivial_note(text) then return end
-    if is_symbol_only(text) then return end
+local function remember_definition(definitions, anchor, inner, text)
+    if not anchor or anchor == "" then return text end
+    -- Reuse preparation for every anchor in this capture. False also caches
+    -- rejected content; nil means no nonempty anchor has required it yet.
+    if text == nil then
+        text = clean_note_text(inner)
+        if text == "" or is_trivial_note(text) or is_symbol_only(text) then
+            return false
+        end
+    elseif text == false then
+        return false
+    end
     -- Ancestor blocks spanning most of the chapter poison the definition;
     -- reject oversized candidates outright instead of storing them.
     if #text > MAX_NOTE_TEXT_BYTES then
         logger.warn("dropping oversized note candidate:",
             "anchor=", tostring(anchor), "bytes=", tostring(#text))
-        return
+        return text
     end
     local current = definitions[anchor]
     -- The true note content is the smallest region describing the anchor,
@@ -290,6 +297,7 @@ local function remember_definition(definitions, anchor, inner)
     if not current or #text < #current.text then
         definitions[anchor] = { text = text }
     end
+    return text
 end
 
 local function collect_definitions(html)
@@ -302,11 +310,11 @@ local function collect_definitions(html)
         }
         for _j, pattern in ipairs(patterns) do
             for attrs, inner in html:gmatch(pattern) do
-                remember_definition(definitions,
+                local text = remember_definition(definitions,
                     get_attr(attrs, "id") or get_attr(attrs, "name"), inner)
                 for raw_tag in inner:gmatch("<[%a][^>]*>") do
-                    remember_definition(definitions,
-                        get_attr(raw_tag, "id") or get_attr(raw_tag, "name"), inner)
+                    text = remember_definition(definitions,
+                        get_attr(raw_tag, "id") or get_attr(raw_tag, "name"), inner, text)
                 end
             end
         end

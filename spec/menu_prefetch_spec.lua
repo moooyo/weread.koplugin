@@ -18,6 +18,7 @@ for _, name in ipairs({
     "ui/widget/buttondialog",
     "ui/widget/confirmbox",
     "ui/widget/infomessage",
+    "ui/widget/pathchooser",
 }) do
     package.preload[name] = function()
         return { new = function(_self, options) return options end }
@@ -32,6 +33,8 @@ end
 package.preload["weread.lib.logger"] = function()
     return { info = function() end }
 end
+package.preload["weread.lib.content"] = function() return {} end
+package.preload["weread.lib.scan"] = function() return {} end
 package.preload["weread.ui.thought_popup"] = function()
     return { closeVisible = function() end }
 end
@@ -46,6 +49,7 @@ package.preload["weread.lib.plugin_util"] = function()
 end
 
 local Menu = require("weread.ui.menu")
+local Cache = require("weread.ui.cache")
 
 local checks, failures = 0, 0
 local function expect(value, label)
@@ -108,6 +112,8 @@ local host = {
     safeCallback = function(_self, _label, callback) return callback end,
 }
 for key, value in pairs(Menu) do host[key] = value end
+host.getChapterDownloadConcurrency = Cache.getChapterDownloadConcurrency
+host.setChapterDownloadConcurrency = Cache.setChapterDownloadConcurrency
 
 host:onDispatcherRegisterActions()
 expect(registered.weread_show == nil,
@@ -302,6 +308,44 @@ expect(cache_items[1] and cache_items[1].keep_menu_open == true
         and cache_items[2] and cache_items[2].keep_menu_open == true,
     "cache dialogs keep the settings menu open")
 local download_items = download_settings and download_settings.sub_item_table_func()
+local concurrency_item = download_items and download_items[1]
+expect(concurrency_item and concurrency_item.text_func()
+        == "Concurrent chapter downloads: %1",
+    "chapter concurrency is the first download setting")
+local concurrency_items = concurrency_item and concurrency_item.sub_item_table_func() or {}
+expect(#concurrency_items == 5 and concurrency_items[5].checked_func(),
+    "chapter concurrency must offer exactly 1-5 and default to five")
+local running_job = { concurrency = 5 }
+host.downloader._active_job = running_job
+for value = 1, 5 do
+    local before_flush, before_widget, updates = flush_count, shown_widget, 0
+    concurrency_items[value].callback({ updateItems = function() updates = updates + 1 end })
+    expect(cache.chapter_download_concurrency == value and flush_count == before_flush + 1,
+        "chapter concurrency choice was not persisted once")
+    expect(updates == 1 and shown_widget == before_widget,
+        "chapter concurrency must update the menu without a confirmation dialog")
+    for index, item in ipairs(concurrency_items) do
+        expect(item.checked_func() == (index == value),
+            "chapter concurrency choices did not retain a single selected value")
+    end
+    expect(host.downloader._active_job == running_job and running_job.concurrency == 5,
+        "saving concurrency altered a running download instead of a future job")
+end
+for _, case in ipairs({
+    { value = "invalid", expected = 5 }, { value = false, expected = 5 },
+    { value = 0, expected = 1 }, { value = 10, expected = 5 },
+    { value = "2", expected = 2 }, { value = 3.9, expected = 3 },
+    { value = math.huge, expected = 5 }, { value = 0 / 0, expected = 5 },
+}) do
+    cache.chapter_download_concurrency = case.value
+    expect(host:getChapterDownloadConcurrency() == case.expected,
+        "chapter concurrency getter did not normalize malformed settings")
+    expect(host:setChapterDownloadConcurrency(case.value) == case.expected
+        and cache.chapter_download_concurrency == case.expected,
+        "chapter concurrency setter did not persist the normalized value")
+end
+host:setChapterDownloadConcurrency(nil)
+expect(cache.chapter_download_concurrency == 5, "missing concurrency did not restore the default")
 local prefetch
 local footnote_popup
 for _, item in ipairs(download_items or {}) do

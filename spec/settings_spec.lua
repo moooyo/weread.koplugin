@@ -114,6 +114,7 @@ expect(values.books["42"].cache_dir == "/cache/42",
     "authentication migration changed the book index")
 expect(values.config_loaded == nil, "legacy setting was not removed")
 expect(values.cache.download_book_images == false
+    and values.cache.chapter_download_concurrency == 5
     and values.cache.download_mp_images == false
     and values.cache.book_footnotes_in_popup == false
     and values.cache.download_underlines_and_thoughts == false
@@ -167,5 +168,22 @@ settings:reset_account()
 expect(values.api_key == "" and next(values.cookies) == nil
     and values.account.name == "",
     "account reset left credentials behind")
+
+-- New and migrated settings use the same bounded concurrency policy.
+for _, case in ipairs({
+    { value = 1, expected = 1 }, { value = 3, expected = 3 },
+    { value = "2", expected = 2 }, { value = 3.9, expected = 3 },
+    { value = 0, expected = 1 }, { value = 10, expected = 5 },
+    { value = "invalid", expected = 5 }, { value = false, expected = 5 },
+    { value = math.huge, expected = 5 }, { value = 0 / 0, expected = 5 },
+}) do
+    values.cache.chapter_download_concurrency = case.value
+    local reopened = Settings:new()
+    expect(reopened:get("cache").chapter_download_concurrency == case.expected,
+        "stored chapter concurrency was not normalized")
+end
+values.cache = nil
+expect(Settings:new():get("cache").chapter_download_concurrency == 5,
+    "a fresh installation did not default to five concurrent chapters")
 
 print(("settings_spec: %d checks"):format(checks))

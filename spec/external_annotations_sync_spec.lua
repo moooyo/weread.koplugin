@@ -51,9 +51,9 @@ local job = new("single", chapters)
 local store = helper.new()
 for _ = 1, 100 do
     assert(job:step() ~= nil)
-    if store:get("book", "batch", "1:1") then break end
+    if next(store:listKeys("book", "batch", "1")) then break end
 end
-assert(store:get("book", "batch", "1:1"), "first batch not persisted")
+assert(next(store:listKeys("book", "batch", "1")), "first batch not persisted")
 job.cancelled = true
 local count = #calls
 assert(finish(new("single", chapters)))

@@ -18,6 +18,7 @@ local DEFAULT_TIMEOUT_SECONDS = 180
 local DEFAULT_CANCEL_GRACE_SECONDS = 5
 local DEFAULT_POLL_INTERVAL = 0.25
 local MEMORY_COOLDOWN_SECONDS = 30
+local inside_subprocess = false
 
 local function read_file(path)
     local file = io.open(path, "rb")
@@ -115,7 +116,7 @@ function Worker:available()
 end
 
 function Worker:busy()
-    return self.job ~= nil
+    return self.job ~= nil or self.completing == true
 end
 
 function Worker:_token()
@@ -153,14 +154,53 @@ end
 
 function Worker:_complete(request, result)
     if request and request.options and type(request.options.on_done) == "function" then
+        -- Synchronous launch failures also complete without a live job. Keep
+        -- reentrant submissions queued, preserving any outer completion guard.
+        local previous = self.completing
+        self.completing = true
         local ok, err = pcall(request.options.on_done, result)
+        self.completing = previous
         if not ok then
             require("weread.lib.logger").warn("background worker callback:", tostring(err))
         end
     end
 end
 
+function Worker:_launchGroup(request, now, free_kb)
+    local Group = require("weread.lib.background_group")
+    local directory = self.temp_dir .. "/group-" .. request.token
+    if not ensure_dir(directory) then
+        self:_complete(request, { ok = false, error = "worker_unavailable" })
+        return false, "worker_unavailable"
+    end
+    local group = Group:new {
+        owner = self, request = request, concurrency = request.concurrency,
+        is_parent = function() return not inside_subprocess end,
+        additional_slot_memory_kb = request.options.additional_slot_memory_kb,
+        memory_wait_seconds = request.options.memory_wait_seconds,
+        slot_factory = function(index)
+            return Worker:new {
+                temp_dir = directory .. "/slot-" .. tostring(index),
+                runner = self.runner, scheduler = self.scheduler,
+                min_available_kb = self.min_available_kb, timeout = self.timeout,
+                cancel_grace = self.cancel_grace, poll_interval = self.poll_interval,
+                now = self.now, read_memory = self.read_memory,
+            }
+        end,
+    }
+    group.temp_dir = directory
+    self.job = { request = request, group = group, started_at = now, last_progress_at = now }
+    -- Group setup and every slot launch run on the UI side. There is no outer
+    -- child PID; callers use the root request handle for cancellation/draining.
+    if group:_call(request.options.on_launch, nil, free_kb) and not group.result then
+        group:_call(request.options.start, group)
+    end
+    self:_schedule()
+    return true
+end
+
 function Worker:_launch(request)
+    if inside_subprocess then return false, "nested_worker_forbidden" end
     if not self.runner then
         self:_complete(request, { ok = false, error = "worker_unavailable" })
         return false, "worker_unavailable"
@@ -178,6 +218,7 @@ function Worker:_launch(request)
         })
         return false, "low_memory"
     end
+    if request.group then return self:_launchGroup(request, now, free_kb) end
 
     local prefix = self.temp_dir .. "/prefetch-" .. request.token
     local progress_path = prefix .. ".progress.json"
@@ -212,10 +253,13 @@ function Worker:_launch(request)
                 end
             end,
         }
+        local previous_subprocess = inside_subprocess
+        inside_subprocess = true
         local ok, value = xpcall(function()
             context.checkCancelled()
             return request.options.task(context)
         end, debug.traceback)
+        inside_subprocess = previous_subprocess
         local cancelled_error = not ok
             and tostring(value):find("__weread_worker_cancelled__", 1, true) ~= nil
         local payload = ok and { ok = true, value = value,
@@ -250,36 +294,79 @@ function Worker:_launch(request)
 end
 
 function Worker:_startPending()
-    if self.job or not self.pending then return end
-    local pending = self.pending
-    self.pending = nil
-    self:_launch(pending)
+    if self.job or self.completing then return end
+    local pending
+    if self.pending_queue and #self.pending_queue > 0 then
+        pending = table.remove(self.pending_queue, 1)
+    else
+        pending = self.pending
+        self.pending = nil
+    end
+    if pending then
+        if not self:_launch(pending) then self:_startPending() end
+        return
+    end
+    self.draining = nil
+    local callbacks = self.idle_callbacks
+    self.idle_callbacks = nil
+    for _, callback in ipairs(callbacks or {}) do pcall(callback) end
 end
 
-function Worker:start(options)
-    options = options or {}
-    assert(type(options.task) == "function", "worker task required")
-    local request = { token = self:_token(), options = options }
-    if self.job then
+function Worker:_submit(options, is_group, concurrency)
+    if inside_subprocess then return false, "nested_worker_forbidden" end
+    if self.draining then return false, "worker_draining" end
+    local request = { token = self:_token(), options = options,
+        group = is_group, concurrency = concurrency }
+    if self.job or self.completing then
         if not options.queue then return false, "worker_busy" end
-        if self.pending then
-            local previous = self.pending
-            self.pending = nil
+        local previous
+        if options.preserve_queue then
+            self.pending_queue = self.pending_queue or {}
+            self.pending_queue[#self.pending_queue + 1] = request
+        else
+            previous = self.pending
+            self.pending = request
+        end
+        if previous then
             self:_complete(previous, { ok = false, cancelled = true,
                 error = "replaced" })
         end
-        self.pending = request
-        if options.replace_active then
+        if self.job and options.replace_active and not self.job.request.options.preserve_queue then
             self:cancel(self.job.request, "superseded")
         end
         return true, request
     end
     local ok, err = self:_launch(request)
-    if not ok then return false, err end
+    if not ok then
+        self:_startPending()
+        return false, err
+    end
     return true, request
 end
 
+function Worker:start(options)
+    options = options or {}
+    assert(type(options.task) == "function", "worker task required")
+    return self:_submit(options)
+end
+
+function Worker:startGroup(options)
+    options = options or {}
+    assert(type(options.start) == "function", "group start callback required")
+    local concurrency = tonumber(options.concurrency) or 1
+    assert(concurrency >= 1 and concurrency <= 5 and concurrency == math.floor(concurrency),
+        "group concurrency must be an integer from 1 to 5")
+    return self:_submit(options, true, concurrency)
+end
+
 function Worker:cancel(request, reason)
+    for index, pending in ipairs(self.pending_queue or {}) do
+        if pending == request then
+            table.remove(self.pending_queue, index)
+            self:_complete(request, { ok = false, cancelled = true, error = reason or "cancelled" })
+            return true
+        end
+    end
     if request and self.pending == request then
         self.pending = nil
         self:_complete(request, { ok = false, cancelled = true,
@@ -288,6 +375,13 @@ function Worker:cancel(request, reason)
     end
     local job = self.job
     if not job or (request and job.request ~= request) then return false end
+    if job.group then
+        job.cancel_requested_at = job.cancel_requested_at or self.now()
+        job.request.cancel_reason = reason or "cancelled"
+        job.group:cancel(job.request.cancel_reason)
+        self:_schedule()
+        return true
+    end
     if not job.cancel_requested_at then
         job.request.cancel_reason = reason or "cancelled"
         local ok = atomic_write(job.cancel_path, "1")
@@ -301,9 +395,57 @@ function Worker:cancel(request, reason)
     return true
 end
 
-function Worker:_poll()
+-- Drain all children before a caller removes cache files or changes ownership.
+function Worker:cancelAll(reason, on_idle)
+    self.draining = true
+    if on_idle then
+        self.idle_callbacks = self.idle_callbacks or {}
+        self.idle_callbacks[#self.idle_callbacks + 1] = on_idle
+    end
+    local pending = self.pending_queue or {}
+    if self.pending then pending[#pending + 1] = self.pending end
+    self.pending, self.pending_queue = nil, nil
+    for _, request in ipairs(pending) do
+        self:_complete(request, { ok = false, cancelled = true, error = reason or "cancelled" })
+    end
+    if self.job then self:cancel(self.job.request, reason)
+    else self:_startPending() end
+end
+
+-- Run a cache operation after one writer exits without cancelling unrelated
+-- durable jobs that are queued behind it.
+function Worker:cancelAndWait(request, reason, on_exit)
     local job = self.job
-    if not job then self:_startPending(); return end
+    if job and (not request or job.request == request) then
+        if on_exit then
+            job.exit_callbacks = job.exit_callbacks or {}
+            job.exit_callbacks[#job.exit_callbacks + 1] = on_exit
+        end
+        return self:cancel(job.request, reason)
+    end
+    local cancelled = self:cancel(request, reason)
+    if on_exit then on_exit() end
+    return cancelled
+end
+
+function Worker:_retire(job, result)
+    -- Completion callbacks may enqueue new work. Keep it queued until every
+    -- exit callback (including cache deletion) has run, without a live writer.
+    self.completing = true
+    self.job = nil
+    local cleaned, cleanup_err = pcall(function()
+        if job.group then job.group:cleanup() else self:_cleanup(job) end
+    end)
+    if not cleaned then
+        pcall(function() require("weread.lib.logger").warn("worker cleanup:", tostring(cleanup_err)) end)
+    end
+    self:_complete(job.request, result)
+    for _, callback in ipairs(job.exit_callbacks or {}) do pcall(callback) end
+    self.completing = nil
+    self:_startPending()
+end
+
+function Worker:_deliverProgress(job)
     local progress, raw = self:_decode(job.progress_path)
     if progress and raw ~= job.last_progress_raw
         and tostring(progress.task_token or "") == job.request.token then
@@ -313,6 +455,22 @@ function Worker:_poll()
             pcall(job.request.options.on_progress, progress)
         end
     end
+end
+
+function Worker:_poll()
+    local job = self.job
+    if not job then self:_startPending(); return end
+    if job.group then
+        if not job.group.result and self.now() - job.last_progress_at
+            >= (tonumber(job.request.options.timeout) or self.timeout) then
+            job.group:finish({ ok = false, error = "worker_timeout" })
+        end
+        local done, result = job.group:poll()
+        if not done then self:_schedule(); return end
+        self:_retire(job, result)
+        return
+    end
+    self:_deliverProgress(job)
 
     local now = self.now()
     if job.cancel_requested_at and not job.terminated
@@ -332,16 +490,16 @@ function Worker:_poll()
         self:_schedule()
         return
     end
+    -- The child may publish its final state between the first read and exit.
+    -- Once reaped, reread the stable file before completing the request.
+    self:_deliverProgress(job)
     local result = self:_decode(job.result_path)
     if not result or tostring(result.task_token or "") ~= job.request.token then
         result = { ok = false,
             cancelled = job.cancel_requested_at ~= nil,
             error = job.request.cancel_reason or "worker_no_result" }
     end
-    self.job = nil
-    self:_cleanup(job)
-    self:_complete(job.request, result)
-    self:_startPending()
+    self:_retire(job, result)
 end
 
 Worker.available_memory_kb = available_memory_kb

@@ -50,6 +50,7 @@ package.preload["ffi/archiver"] = function()
     function Writer:new() return setmetatable({}, { __index = self }) end
     function Writer:open(path)
         self.path = path
+        self.members = {}
         local file = assert(io.open(path, "wb"))
         file:write("partial archive")
         file:close()
@@ -60,6 +61,7 @@ package.preload["ffi/archiver"] = function()
         return true
     end
     function Writer:addFileFromMemory(name, data)
+        self.members[name] = true
         archive_calls[#archive_calls + 1] = {
             kind = "memory", name = name, bytes = #data, data = data,
         }
@@ -73,11 +75,18 @@ package.preload["ffi/archiver"] = function()
             self.err = "injected archive failure"
             return false
         end
+        local files = assert(io.popen("find " .. string.format("%q", path) .. " -type f"))
+        for source in files:lines() do
+            self.members[name .. "/" .. source:sub(#path + 2)] = true
+        end
+        files:close()
         -- Match KOReader's wrapper: a successful disk walk terminates at EOF
         -- and currently returns false without setting err.
         return false
     end
-    function Writer:close() end
+    function Writer:close()
+        require("spec.helpers.minimal_zip").write(self.path, self.members)
+    end
     return { Reader = Reader, Writer = Writer }
 end
 package.preload["ffi/util"] = function()
@@ -208,13 +217,13 @@ for _, call in ipairs(archive_calls) do
     if call.kind == "path" then
         path_calls = path_calls + 1
         if call.name == "OEBPS/images" then
-            used_path = call.path == workspace.asset_dir
+            used_path = call.path ~= workspace.asset_dir
                 and call.recursive == true
         end
     end
 end
 expect(used_path and path_calls == 1,
-    "EPUB writer did not stream the staged image directory with one addPath")
+    "EPUB writer did not stream an exact output image directory with one addPath")
 expect(io.open(output .. ".part", "rb") == nil,
     "successful EPUB build left a partial archive")
 local opf

@@ -302,4 +302,76 @@ for _, anchor in ipairs({ "glyph-arrow", "glyph-arrow-vs", "glyph-left",
         "symbol-only candidate was stored as note text: " .. anchor)
 end
 
+-- A capture may define multiple anchor aliases without sharing mutable
+-- definition records. Empty ids continue to take precedence over names.
+local aliases_scan = Footnotes.scan_chapter(
+    '<section id="outer-alias"><span id="first-alias"></span>'
+        .. '<b name="second-alias"></b><i id="" name="ignored-alias"></i>'
+        .. '[7] A &amp; B</section>', chapter)
+for _, anchor in ipairs({ "outer-alias", "first-alias", "second-alias" }) do
+    expect(aliases_scan.definitions[anchor]
+        and aliases_scan.definitions[anchor].text == "A & B",
+        "shared capture did not preserve alias content: " .. anchor)
+end
+expect(aliases_scan.definitions["first-alias"]
+        ~= aliases_scan.definitions["second-alias"],
+    "anchor aliases unexpectedly shared a mutable definition record")
+expect(aliases_scan.definitions["ignored-alias"] == nil,
+    "empty id no longer took precedence over name")
+
+-- Preparation must preserve the second normalization performed by the
+-- trivial-note check, including escaped markup and nested entities.
+for _, text in ipairs({ "&amp;nbsp;", "&lt;b&gt;&lt;/b&gt;" }) do
+    local empty_scan = Footnotes.scan_chapter(
+        '<section><span id="empty-one"></span>'
+            .. '<span name="empty-two"></span>' .. text .. '</section>', chapter)
+    expect(next(empty_scan.definitions) == nil,
+        "cached preparation changed nested-entity rejection")
+end
+
+-- Count bytes offered to string substitutions instead of elapsed time.
+-- Growing the anchor count must not multiply whole-capture preparation.
+local function scan_work(anchor_count, body, expected_text)
+    local parts = { "<section>" }
+    for i = 1, anchor_count do
+        parts[#parts + 1] = ('<span id="alias-%04d"></span>'):format(i)
+    end
+    parts[#parts + 1] = body
+    parts[#parts + 1] = "</section>"
+    local html = table.concat(parts)
+    local original_gsub, work = string.gsub, 0
+    rawset(string, "gsub", function(subject, ...)
+        work = work + #subject
+        return original_gsub(subject, ...)
+    end)
+    local ok, result = pcall(Footnotes.scan_chapter, html, chapter)
+    rawset(string, "gsub", original_gsub)
+    if not ok then error(result) end
+    if expected_text then
+        expect(result.definitions["alias-0001"]
+                and result.definitions["alias-0001"].text == expected_text
+                and result.definitions[("alias-%04d"):format(anchor_count)]
+                and result.definitions[("alias-%04d"):format(anchor_count)].text
+                    == expected_text,
+            "growing capture lost its first or last anchor")
+    else
+        expect(next(result.definitions) == nil,
+            "growing invalid capture unexpectedly produced a definition")
+    end
+    return work
+end
+
+for _, fixture in ipairs({
+    { body = "[7] Meaningful note body", text = "Meaningful note body" },
+    { body = "[7]" },
+    { body = string.rep("\226\134\169", 64) },
+    { body = string.rep("Long note text. ", 401) },
+}) do
+    local small_work = scan_work(64, fixture.body, fixture.text)
+    local large_work = scan_work(256, fixture.body, fixture.text)
+    expect(large_work <= small_work * 5,
+        "quadrupling aliases multiplied capture preparation: "
+            .. tostring(small_work) .. " -> " .. tostring(large_work))
+end
+
 print(("footnotes_spec: %d checks"):format(checks))

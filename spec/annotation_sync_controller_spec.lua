@@ -60,9 +60,11 @@ local host = {
     runOnlineTask = function(_self, _label, callback) callback() end,
     _xpointerOverlayPrototypeAvailable = function() return true end,
 }
+local worker_launches = {}
 host.prefetch_worker = {
     available = function() return true end,
     start = function(_self, options)
+        worker_launches[#worker_launches + 1] = options
         local handle = {}
         if options.on_launch then options.on_launch(123, 96 * 1024) end
         local emitted = {}
@@ -128,7 +130,7 @@ assert(titles:find("Matching underlines 1/1 · chapter 1/1", 1, true),
 local thought_progress_moved = false
 for _, update in ipairs(progress_updates) do
     if update.title == "Downloading thoughts 1/1 · chapter 1/1"
-        and update.progress == 0.5 then
+        and update.progress == 0.4 then
         thought_progress_moved = true
         break
     end
@@ -149,6 +151,9 @@ assert(calls == 1 and prevented == allowed)
 host:prefetchChapterAnnotations({ book_id = "book" }, { chapterUid = "2" })
 drain()
 assert(calls == 2 and store:get("book", "source", "2"))
+assert(worker_launches[1].preserve_queue == true
+    and worker_launches[#worker_launches].preserve_queue == false,
+    "foreground annotations must be protected while speculative prefetch remains replaceable")
 assert(not store:get("book", "projection", "single:2"))
 -- Turning off preparation suppresses future annotation requests.
 host:setAnnotationPrefetchEnabled(false)
@@ -237,5 +242,87 @@ assert(helper.legacy_entries.single
     and helper.legacy_entries.single.binding.book_id == "book"
     and helper.legacy_entries.single.records == nil,
     "clearing did not remove legacy records while preserving the binding")
+
+-- Foreground requests prepare sources through the worker, then match only in
+-- the document-owning process. No network work starts in the queued UI step.
+local worker_options, worker_cancellations, document_matches = nil, 0, 0
+local original_find = host.ui.document.findAllText
+host.ui.document.findAllText = function(...)
+    document_matches = document_matches + 1
+    return original_find(...)
+end
+host.prefetch_worker.start = function(_self, options)
+    worker_options = options
+    return true, {}
+end
+host.prefetch_worker.cancel = function() worker_cancellations = worker_cancellations + 1; return true end
+context.chapters = { { chapterUid = "worker-phase" } }
+context.statuses = {}
+local calls_before_worker = calls
+host:_runAnnotationJob(context, {})
+drain()
+assert(worker_options and calls == calls_before_worker and document_matches == 0,
+    "foreground source preparation executed network or document work before the worker ran")
+assert(worker_options.preserve_queue == true and worker_options.book_id == context.book_id,
+    "foreground annotation work did not reserve its queue entry or book identity")
+worker_options.on_launch(456, 96 * 1024)
+local worker_value = worker_options.task {
+    checkCancelled = function() end,
+    emit = function(state) worker_options.on_progress(state) end,
+    sleep = function() end,
+}
+assert(calls == calls_before_worker + 1 and document_matches == 0
+    and store:get("book", "source_status", "worker-phase"),
+    "source worker must save annotations without touching the live document")
+worker_options.on_done({ ok = true, value = worker_value })
+drain()
+assert(document_matches > 0 and calls == calls_before_worker + 1
+    and store:get("book", "projection", "single:worker-phase"),
+    "worker completion did not start offline document matching")
+assert(prevented == allowed and host._external_annotation_sync == nil,
+    "two-phase completion retained the guard or active request")
+
+-- Clearing waits for an existing child to stop before deleting its database
+-- rows, so an in-flight response cannot recreate the just-cleared cache.
+host:_runAnnotationJob(context, { refresh = true })
+drain()
+host:clearUnifiedAnnotationProjections()
+assert(worker_cancellations == 1 and store:get("book", "source_status", "worker-phase"),
+    "clear deleted source data before the worker acknowledged cancellation")
+local cleared_context = context
+context = { path = "other-book", book_id = "other-book", document_key = "other-book",
+    store = store, chapters = {}, statuses = {}, ranges = {}, binding = { book_id = "other-book" } }
+host._annotation_context = context
+host.ui.document.file = context.path
+store:put("other-book", "source", "keep", { underlines = {} }, "keep")
+local other_overlay = { { id = "other-book-overlay" } }
+host._xpointer_overlay.records = other_overlay
+worker_options.on_done({ ok = false, cancelled = true, error = "cancelled" })
+assert(not store:get("book", "source_status", "worker-phase")
+    and host._external_annotation_sync == nil and prevented == allowed,
+    "clear did not finish after worker cancellation")
+assert(store:get("other-book", "source", "keep") and host._xpointer_overlay.records == other_overlay,
+    "deferred cleanup cleared the newly opened book instead of its captured context")
+context = cleared_context
+host._annotation_context = context
+host.ui.document.file = context.path
+
+-- Platforms without subprocess support retain the explicit foreground path.
+local fallback_notices = {}
+host.showTransientInfo = function(_self, message) fallback_notices[#fallback_notices + 1] = message end
+host.prefetch_worker.available = function() return false end
+context.chapters = { { chapterUid = "fallback" } }
+host:_runAnnotationJob(context, {})
+drain()
+assert(#fallback_notices > 0 and store:get("book", "projection", "single:fallback"),
+    "the unavailable-worker fallback did not explain and complete foreground matching")
+
+-- A worker may fail to launch without delivering a completion callback.
+host.prefetch_worker.available = function() return true end
+host.prefetch_worker.start = function() return false, "low_memory" end
+host:_runAnnotationJob(context, { refresh = true })
+drain()
+assert(host._external_annotation_sync == nil and prevented == allowed,
+    "failed worker launch retained the guard or active request")
 helper.cleanup()
 print("annotation_sync_controller_spec: consent, completion, cancellation, sessions and prefetch passed")

@@ -223,33 +223,51 @@ function M:_refreshAnnotationOverlay()
 end
 
 function M:_cancelUnifiedAnnotationSync(preserve_pending)
+    if not preserve_pending then
+        self._annotation_pending_start = nil
+        self._annotation_pending_prefetch = nil
+    end
     local request = self._external_annotation_sync
     if not request then return end
+    request.cancelled = true
     if request.job then request.job.cancelled = true end
-    if request.progress then request.progress:close() end
-    if request.guard then require("weread.lib.standby_guard").release(request.guard) end
-    request.guard = nil
+    local progress = request.progress
+    request.progress = nil
+    if progress then pcall(progress.close, progress) end
     if request.worker_handle and self.prefetch_worker then
-        request.cancelled = true
         self.prefetch_worker:cancel(request.worker_handle, "cancelled")
         if not preserve_pending then self._annotation_pending_prefetch = nil end
         return
     end
+    local guard = request.guard
+    request.guard = nil
+    if guard then pcall(require("weread.lib.standby_guard").release, guard) end
     self._external_annotation_sync = nil
     if not preserve_pending then self._annotation_pending_prefetch = nil end
 end
 
+function M:_schedulePendingAnnotations(pending)
+    if not pending then return end
+    self._annotation_pending_start = pending
+    UIManager:scheduleIn(0.01, function()
+        if self._annotation_pending_start ~= pending then return end
+        self._annotation_pending_start = nil
+        if self._external_annotation_sync then return end
+        if not pending.options.prefetch and file(self) ~= pending.context.path then return end
+        self:_runAnnotationJob(pending.context, pending.options)
+    end)
+end
+
 function M:_finishAnnotationPrefetchWorker(request, result)
-    if request.guard then
-        require("weread.lib.standby_guard").release(request.guard)
-        request.guard = nil
-    end
     request.worker_handle = nil
-    if type(result) == "table" and result.ok then
+    request.worker_running = false
+    local success = type(result) == "table" and result.ok
+    if success and not request.cancelled then
         if result.value and result.value.auth then
             local WorkerSettings = require("weread.lib.worker_settings")
-            if not WorkerSettings.merge(self.settings, request.auth_fingerprint,
-                result.value.auth) then
+            local merged, applied = pcall(WorkerSettings.merge, self.settings,
+                request.auth_fingerprint, result.value.auth)
+            if not merged or not applied then
                 logger.info("skip annotation worker auth write-back: parent auth changed")
             end
         end
@@ -257,12 +275,34 @@ function M:_finishAnnotationPrefetchWorker(request, result)
         logger.warn("annotation prefetch worker failed:",
             tostring(type(result) == "table" and result.error or "no result"))
     end
-    if self._external_annotation_sync == request then
-        self._external_annotation_sync = nil
+    if self._external_annotation_sync ~= request then return end
+    if success and request.prepare_sources and not request.cancelled
+        and file(self) == request.context.path and self._reader_session_gen == request.session then
+        request.source_phase = nil
+        request.sources_prepared = true
+        local started, start_err = pcall(self._runAnnotationMatching, self,
+            request, request.context, request.options)
+        if not started then
+            self:_cancelUnifiedAnnotationSync()
+            logger.warn("annotation matching setup failed:", tostring(start_err))
+            if not request.options.background then
+                self:showInfo(T(_("Annotation sync paused: %1\nSaved progress will be reused."), tostring(start_err)))
+            end
+        end
+        return
     end
     local pending = self._annotation_pending_prefetch
-    self._annotation_pending_prefetch = nil
-    if pending then self:_runAnnotationJob(pending.context, pending.options) end
+    local cancelled = request.cancelled
+    self:_cancelUnifiedAnnotationSync()
+    if request.after_cancel then
+        local cleaned, cleanup_err = pcall(request.after_cancel)
+        if not cleaned then logger.warn("annotation deferred cleanup failed:", tostring(cleanup_err)) end
+    end
+    if not success and not cancelled and not request.options.background then
+        self:showInfo(T(_("Annotation sync paused: %1\nSaved progress will be reused."),
+            tostring(type(result) == "table" and result.error or "no result")))
+    end
+    self:_schedulePendingAnnotations(pending)
 end
 
 function M:_runAnnotationPrefetchWorker(request, context, options)
@@ -275,21 +315,27 @@ function M:_runAnnotationPrefetchWorker(request, context, options)
     local WorkerSettings = require("weread.lib.worker_settings")
     local AnnotationWorker = require("weread.lib.annotation_prefetch_worker")
     request.auth_fingerprint = WorkerSettings.fingerprint(self.settings)
+    request.worker_running = true
     local ok, handle = worker:start {
         queue = true,
+        book_id = context.book_id,
+        preserve_queue = options.prefetch ~= true,
         timeout = 180,
         task = function(worker_context)
             return AnnotationWorker.run(self.settings, self.client, context,
-                options.chapters or context.chapters, worker_context)
+                options.chapters or context.chapters, worker_context, options)
         end,
         on_launch = function(pid, available_kb)
             if self._external_annotation_sync ~= request then return end
-            request.guard = require("weread.lib.standby_guard").acquire()
+            request.auth_fingerprint = WorkerSettings.fingerprint(self.settings)
+            if not request.guard then request.guard = require("weread.lib.standby_guard").acquire() end
             logger.info("annotation prefetch worker started:",
                 "pid=", tostring(pid),
                 "available_kb=", tostring(available_kb or "unknown"))
         end,
         on_progress = function(state)
+            if self._external_annotation_sync ~= request or request.cancelled then return end
+            self:_reportAnnotationProgress(request, state)
             logger.info("annotation prefetch progress:",
                 "stage=", tostring(state.stage),
                 "chapter=", tostring(state.index or 0) .. "/"
@@ -301,14 +347,17 @@ function M:_runAnnotationPrefetchWorker(request, context, options)
             self:_finishAnnotationPrefetchWorker(request, result)
         end,
     }
-    if ok and self._external_annotation_sync == request then
+    if ok and request.worker_running and self._external_annotation_sync == request then
         request.worker_handle = handle
+    elseif not ok and self._external_annotation_sync == request then
+        self:_finishAnnotationPrefetchWorker(request, { ok = false, error = handle })
     end
     return ok
 end
 
 function M:_runAnnotationJob(context, options)
     options = options or {}
+    self._annotation_pending_start = nil
     if self._external_annotation_sync then
         if options.background then
             self._annotation_pending_prefetch = { context = context, options = options }
@@ -321,8 +370,8 @@ function M:_runAnnotationJob(context, options)
         end
         self:_cancelUnifiedAnnotationSync()
     end
-    local Sync = require("weread.lib.annotation_sync")
-    local request = { context = context, session = self._reader_session_gen, prefetch = options.prefetch }
+    local request = { context = context, options = options, session = self._reader_session_gen,
+        prefetch = options.prefetch, total = #(options.chapters or context.chapters) }
     self._external_annotation_sync = request
     if options.prefetch then
         return self:_runAnnotationPrefetchWorker(request, context, options)
@@ -341,6 +390,41 @@ function M:_runAnnotationJob(context, options)
         request.progress:show()
         request.guard = require("weread.lib.standby_guard").acquire()
     end
+    if not options.offline and not options.refresh then
+        local sources = context.store:list(context.book_id, "source_status")
+        local refreshes = context.store:list(context.book_id, "refresh")
+        request.sources_prepared = true
+        for _, chapter in ipairs(options.chapters or context.chapters) do
+            local uid = Chapters.uid(chapter)
+            if not sources[uid] or refreshes[uid] then request.sources_prepared = nil; break end
+        end
+    end
+    if not options.offline and not request.sources_prepared
+        and self.prefetch_worker and self.prefetch_worker:available() then
+        request.prepare_sources, request.source_phase = true, true
+        -- The UI must be able to handle pause/session changes before any child
+        -- launches. Source preparation uses the existing shared worker budget.
+        UIManager:scheduleIn(0.01, function()
+            if self._external_annotation_sync ~= request or request.cancelled then return end
+            if file(self) ~= context.path or self._reader_session_gen ~= request.session then
+                self:_cancelUnifiedAnnotationSync()
+                return
+            end
+            self:_runAnnotationPrefetchWorker(request, context, options)
+        end)
+        return
+    end
+    if not options.offline and not request.sources_prepared then
+        logger.warn("annotation source worker unavailable; using foreground requests")
+        if not options.background then
+            self:showTransientInfo(_("Background annotation download is unavailable; downloading in the foreground."), 3)
+        end
+    end
+    self:_runAnnotationMatching(request, context, options)
+end
+
+function M:_runAnnotationMatching(request, context, options)
+    local Sync = require("weread.lib.annotation_sync")
     local source_book = context.book or { bookId = context.book_id, book_id = context.book_id,
         title = context.binding.title, format = context.binding.format }
     request.job = Sync:new{
@@ -348,7 +432,8 @@ function M:_runAnnotationJob(context, options)
         chapters = options.chapters or context.chapters, ranges = context.ranges,
         document = not options.prefetch and self.ui.document or nil,
         document_key = not options.prefetch and context.document_key or nil,
-        refresh = options.refresh, offline = options.offline,
+        refresh = not request.sources_prepared and options.refresh,
+        offline = request.sources_prepared or options.offline,
         fetch_source = function(chapter)
             local html = Content.fetch_chapter_xhtml(self.client, self.settings, source_book, chapter)
             if source_book._content_format == "txt" then
@@ -408,9 +493,26 @@ function M:_runAnnotationJob(context, options)
                         tostring(summary.chapters), tostring(#context.chapters)))
                 end
             end
-            if done and pending then self:_runAnnotationJob(pending.context, pending.options) end
+            if done then self:_schedulePendingAnnotations(pending) end
             return
         end
+        self:_reportAnnotationProgress(request, state)
+        UIManager:scheduleIn(state.delay or 0.01, safe_step)
+    end
+    safe_step = function()
+        local ok, err = xpcall(step, debug.traceback)
+        if not ok then
+            self:_cancelUnifiedAnnotationSync()
+            logger.warn("annotation_sync UI:", err)
+            if not options.background then
+                self:showInfo(T(_("Annotation sync paused: %1\nSaved progress will be reused."), tostring(err)))
+            end
+        end
+    end
+    UIManager:scheduleIn(0.01, safe_step)
+end
+
+function M:_reportAnnotationProgress(request, state)
         if request.progress then
             local title
             if state.stage == "thoughts" then
@@ -433,22 +535,23 @@ function M:_runAnnotationJob(context, options)
             end
             -- Update the bar before setTitle repaints the dialog, so the text
             -- and bar always describe the same point in the current chapter.
-            request.progress:reportProgress(annotation_progress(state))
-            request.progress:setTitle(title)
-        end
-        UIManager:scheduleIn(state.delay or 0.01, safe_step)
-    end
-    safe_step = function()
-        local ok, err = xpcall(step, debug.traceback)
-        if not ok then
-            self:_cancelUnifiedAnnotationSync()
-            logger.warn("annotation_sync UI:", err)
-            if not options.background then
-                self:showInfo(T(_("Annotation sync paused: %1\nSaved progress will be reused."), tostring(err)))
+            local progress = annotation_progress(state)
+            local fraction = (tonumber(state.count) or 0) > 0
+                and math.min(1, (tonumber(state.current) or 0) / state.count) or 0
+            if request.source_phase then
+                local partial = state.stage == "thoughts" and fraction * 0.8
+                    or state.stage == "source" and 0.9 or 0
+                progress = ((state.completed or 0) + partial) * 0.5
+            elseif request.sources_prepared then
+                progress = request.total * 0.5 + ((state.completed or 0)
+                    + (state.stage == "match" and fraction or 0)) * 0.5
+            end
+            if request.reported_progress ~= progress or request.reported_title ~= title then
+                request.reported_progress, request.reported_title = progress, title
+                request.progress:reportProgress(progress)
+                request.progress:setTitle(title)
             end
         end
-    end
-    UIManager:scheduleIn(0.01, safe_step)
 end
 
 function M:startUnifiedAnnotationSync(options)
@@ -658,17 +761,23 @@ function M:getUnifiedAnnotationMenuItems()
     }
 end
 
-function M:clearUnifiedAnnotationProjections()
-    local context = self:_prepareAnnotationContext(false)
+function M:clearUnifiedAnnotationProjections(context)
+    context = context or self:_prepareAnnotationContext(false)
     if not context then return end
+    local request = self._external_annotation_sync
+    if request and request.worker_handle then
+        request.after_cancel = function() self:clearUnifiedAnnotationProjections(context) end
+        self:_cancelUnifiedAnnotationSync()
+        return true
+    end
     self:_cancelUnifiedAnnotationSync()
     local ok, clear_err = pcall(function()
         -- The mapped chapter list may cover only the current local edition.
         -- Clear derived rows book-wide so unmapped/stale chapters and old
         -- document keys cannot reappear after reopening the book.
         context.store:clearKinds(context.book_id, {
-            "source", "source_status", "download", "batch", "thought",
-            "refresh", "projection", "matching", "status", "generation",
+            "source", "source_status", "download", "underlines", "batch", "thought",
+            "refresh", "projection", "matching", "match_batch", "status",
             "display", "manual_only",
         })
         context.store:write(context.book_id, {
@@ -697,12 +806,14 @@ function M:clearUnifiedAnnotationProjections()
     end
     context.statuses = {}
     context.generation = (context.generation or 0) + 1
-    self._unified_annotations_active = true
-    if self._xpointer_overlay then
-        self._xpointer_overlay._annotation_window = nil
-        self._xpointer_overlay:setRecords({}, true)
+    if self._annotation_context == context and file(self) == context.path then
+        self._unified_annotations_active = true
+        if self._xpointer_overlay then
+            self._xpointer_overlay._annotation_window = nil
+            self._xpointer_overlay:setRecords({}, true)
+        end
+        self:applyAnnotationVisibility()
     end
-    self:applyAnnotationVisibility()
     self:showTransientInfo(_("Underlines and thoughts cleared. Match again to download fresh data."), 3)
     return true
 end

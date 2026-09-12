@@ -334,12 +334,158 @@ local function commit_file(part_path, path)
     return true
 end
 
-local function write_epub(path, entries)
+local function copy_asset(source, destination, options)
+    make_path(destination:match("^(.*)/[^/]+$"))
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
+    if ok_lfs and type(lfs.link) == "function" then
+        local called, linked = pcall(lfs.link, source, destination, false)
+        if called and linked then return end
+    end
+    local input = assert(io.open(source, "rb"))
+    local output
+    local ok, err = xpcall(function()
+        output = assert(io.open(destination, "wb"))
+        while true do
+            if options and options.check_cancelled then options.check_cancelled() end
+            local chunk, read_err = input:read(64 * 1024)
+            if read_err then error(read_err) end
+            if not chunk then break end
+            assert(output:write(chunk))
+        end
+        assert(output:close())
+        output = nil
+    end, debug.traceback)
+    input:close()
+    if output then output:close() end
+    if not ok then error(err, 0) end
+end
+
+local function stage_asset_directory(path, assets, options, scratch_paths)
+    local parent = assert(path:match("^(.*)/[^/]+$"))
+    local scratch = string.format("%s/.weread-download-%d-%d",
+        parent, os.time(), math.random(100000, 999999))
+    local directory = scratch .. "/images"
+    scratch_paths[#scratch_paths + 1] = scratch
+    make_path(directory)
+    for index, asset in ipairs(assets) do
+        if options and options.check_cancelled then options.check_cancelled() end
+        copy_asset(asset.path, directory .. "/" .. asset.href:sub(8), options)
+        if options and options.progress then options.progress("assets", index, #assets) end
+    end
+    return directory
+end
+
+local function zip_integer(bytes, offset, width)
+    local value = 0
+    for index = offset + width - 1, offset, -1 do
+        local byte = bytes:byte(index)
+        assert(byte, "truncated ZIP integer")
+        value = value * 256 + byte
+    end
+    assert(value <= 9007199254740991, "ZIP offset exceeds exact integer range")
+    return value
+end
+
+-- The bundled archive wrapper does not report archive_write_close failures.
+-- Verify the completed central directory before publishing its output. This
+-- checks structure and required members without decompressing or CRC-checking
+-- payloads, and does not establish durability after an OS crash.
+function Content.validate_epub(path, required_names, options)
+    local file, open_err = io.open(path, "rb")
+    if not file then return nil, open_err end
+    local ok, err = xpcall(function()
+        local size = assert(file:seek("end"))
+        assert(size >= 22, "EPUB has no ZIP end record")
+        local tail_size = math.min(size, 65557)
+        assert(file:seek("set", size - tail_size))
+        local tail = assert(file:read(tail_size))
+        local ending
+        for position = #tail - 21, 1, -1 do
+            if tail:sub(position, position + 3) == "PK\005\006"
+                and position + 21 + zip_integer(tail, position + 20, 2) == #tail then
+                ending = position
+                break
+            end
+        end
+        assert(ending, "EPUB has no complete ZIP end record")
+        local directory_end = size - tail_size + ending - 1
+        assert(zip_integer(tail, ending + 4, 2) == 0
+            and zip_integer(tail, ending + 6, 2) == 0, "multi-disk EPUB is unsupported")
+        local count = zip_integer(tail, ending + 10, 2)
+        local disk_count = zip_integer(tail, ending + 8, 2)
+        local directory_size = zip_integer(tail, ending + 12, 4)
+        local directory_offset = zip_integer(tail, ending + 16, 4)
+        if count == 65535 or disk_count == 65535
+            or directory_size == 4294967295 or directory_offset == 4294967295 then
+            assert(directory_end >= 20, "missing ZIP64 locator")
+            assert(file:seek("set", directory_end - 20))
+            local locator = assert(file:read(20))
+            assert(locator:sub(1, 4) == "PK\006\007"
+                and zip_integer(locator, 5, 4) == 0
+                and zip_integer(locator, 17, 4) == 1, "invalid ZIP64 locator")
+            local zip64_offset = zip_integer(locator, 9, 8)
+            assert(file:seek("set", zip64_offset))
+            local record = assert(file:read(56))
+            assert(record:sub(1, 4) == "PK\006\006"
+                and zip_integer(record, 5, 8) >= 44
+                and zip64_offset + 12 + zip_integer(record, 5, 8) <= directory_end - 20,
+                "invalid ZIP64 end record")
+            assert(zip_integer(record, 17, 4) == 0
+                and zip_integer(record, 21, 4) == 0, "multi-disk ZIP64 EPUB is unsupported")
+            disk_count, count = zip_integer(record, 25, 8), zip_integer(record, 33, 8)
+            directory_size, directory_offset = zip_integer(record, 41, 8), zip_integer(record, 49, 8)
+            directory_end = zip64_offset
+        end
+        assert(count > 0 and disk_count == count, "invalid EPUB member count")
+        assert(directory_offset + directory_size <= directory_end,
+            "EPUB central directory exceeds file bounds")
+        local required = required_names or {
+            mimetype = true, ["META-INF/container.xml"] = true, ["OEBPS/content.opf"] = true,
+        }
+        local seen, position = {}, directory_offset
+        for index = 1, count do
+            if options and options.check_cancelled then options.check_cancelled() end
+            assert(position + 46 <= directory_offset + directory_size, "truncated EPUB central directory")
+            assert(file:seek("set", position))
+            local header = assert(file:read(46))
+            assert(header:sub(1, 4) == "PK\001\002", "invalid EPUB central directory member")
+            local name_size = zip_integer(header, 29, 2)
+            local extra_size = zip_integer(header, 31, 2)
+            local comment_size = zip_integer(header, 33, 2)
+            position = position + 46 + name_size + extra_size + comment_size
+            assert(position <= directory_offset + directory_size, "truncated EPUB member name")
+            local name = assert(file:read(name_size))
+            if required[name] then
+                assert(not seen[name], "duplicate EPUB member: " .. name)
+                seen[name] = true
+            end
+            if name == "mimetype" then
+                assert(zip_integer(header, 11, 2) == 0, "EPUB mimetype must be stored")
+            end
+            if options and options.progress and (index % 64 == 0 or index == count) then
+                options.progress("validate", index, count)
+            end
+        end
+        assert(position == directory_offset + directory_size, "EPUB central directory size mismatch")
+        for name in pairs(required) do assert(seen[name], "missing EPUB member: " .. name) end
+    end, debug.traceback)
+    file:close()
+    if not ok then return nil, err end
+    return true
+end
+
+local function write_epub(path, entries, options)
     local Archiver = require("ffi/archiver")
     local archive = Archiver.Writer:new{}
     local part_path = path .. ".part"
+    local scratch_paths = {}
+    local required_names = { mimetype = true }
+    local closed = false
     pcall(os.remove, part_path)
     if not archive:open(part_path, "epub") then
+        pcall(function() archive:close() end)
+        pcall(os.remove, part_path)
         error("failed to open archive for writing: " .. tostring(archive.err))
     end
     local mtime = os.time()
@@ -353,26 +499,42 @@ local function write_epub(path, entries)
             end
         end
         assert(archive:addFileFromMemory("mimetype", mimetype_data, mtime), archive.err)
-        assert(archive:setZipCompression("deflate"), archive.err)
-        for _, entry in ipairs(entries) do
+        for index, entry in ipairs(entries) do
             if entry.name ~= "mimetype" then
+                if options and options.check_cancelled then options.check_cancelled() end
+                assert(archive:setZipCompression(entry.store and "store" or "deflate"), archive.err)
                 local added
-                if entry.path then
+                if entry.assets or entry.path then
+                    local source_path = entry.path
+                    if entry.assets then
+                        source_path = stage_asset_directory(path, entry.assets, options, scratch_paths)
+                        for _, asset in ipairs(entry.assets) do required_names["OEBPS/" .. asset.href] = true end
+                    end
                     added = archive:addPath(
-                        entry.name, entry.path, entry.recursive == true, mtime)
+                        entry.name, source_path, entry.assets ~= nil or entry.recursive == true, mtime)
                     -- KOReader's current Writer:addPath() returns false after
                     -- a successful walk because its terminal status is EOF,
                     -- while leaving err unset. A real libarchive failure sets
                     -- err, so accept only this error-free EOF case.
                     if not added and archive.err == nil then added = true end
                 else
-                    added = archive:addFileFromMemory(entry.name, entry.data or "", mtime)
+                    required_names[entry.name] = true
+                    local data = entry.load and entry.load() or entry.data or ""
+                    added = archive:addFileFromMemory(entry.name, data, mtime)
                 end
                 assert(added, archive.err or ("failed to add " .. entry.name))
+                if options and options.progress then options.progress("archive", index, #entries) end
             end
         end
+        local close_ok = archive:close()
+        closed = true
+        assert(close_ok ~= false and archive.err == nil, archive.err or "failed to close EPUB")
+        local valid, validation_err = Content.validate_epub(part_path, required_names, options)
+        assert(valid, validation_err)
+        if options and options.check_cancelled then options.check_cancelled() end
     end, debug.traceback)
-    pcall(function() archive:close() end)
+    if not closed then pcall(function() archive:close() end) end
+    for _, scratch in ipairs(scratch_paths) do Content.cleanup_download_workspace(scratch) end
     if not ok then
         pcall(os.remove, part_path)
         error(err, 0)
@@ -384,36 +546,65 @@ local function write_epub(path, entries)
     end
 end
 
+local function normalized_assets(assets)
+    local result, by_href = {}, {}
+    for _, asset in ipairs(assets or {}) do
+        assert(type(asset) == "table", "invalid EPUB asset descriptor")
+        local href = asset.href
+        if type(href) ~= "string" or not href:match("^images/[^/]")
+            or href:find("\\", 1, true) or href:find("//", 1, true)
+            or href:sub(-1) == "/" or href:find("%z") then
+            error("invalid EPUB image href: " .. tostring(href))
+        end
+        for segment in href:gmatch("[^/]+") do
+            if segment == "." or segment == ".." then
+                error("invalid EPUB image href: " .. href)
+            end
+        end
+        local existing = by_href[href]
+        if existing then
+            if existing.path ~= asset.path or existing.data ~= asset.data
+                or existing.media_type ~= asset.media_type then
+                error("conflicting EPUB image href: " .. href)
+            end
+        else
+            by_href[href] = asset
+            result[#result + 1] = asset
+        end
+    end
+    return result
+end
+
+local STORED_MEDIA_TYPES = {
+    ["image/jpeg"] = true, ["image/png"] = true, ["image/gif"] = true, ["image/webp"] = true,
+}
+
+local function store_asset(asset)
+    return asset.store == true or (asset.store ~= false and STORED_MEDIA_TYPES[asset.media_type] == true)
+end
+
 local function append_asset_entries(entries, assets)
-    local disk_dir
+    local groups = { store = {}, deflate = {} }
     for _, asset in ipairs(assets or {}) do
         if asset.path then
-            local parent = asset.path:match("^(.*)/[^/]+$")
-            if not parent then
-                error("invalid file-backed asset path: " .. tostring(asset.path))
-            end
-            if disk_dir and disk_dir ~= parent then
-                error("file-backed EPUB assets must share one directory")
-            end
-            disk_dir = parent
+            local group = store_asset(asset) and groups.store or groups.deflate
+            group[#group + 1] = asset
         else
             table.insert(entries, {
                 name = "OEBPS/" .. asset.href,
                 data = asset.data,
-                store = asset.store,
+                store = store_asset(asset),
             })
         end
     end
-    if disk_dir then
-        -- KOReader's libarchive wrapper is reliable for a directory tree, but
-        -- some Kindle builds fail when addPath is given an individual file.
-        -- All disk-backed images are staged together, so stream the directory
-        -- into the EPUB with one reader lifecycle.
-        table.insert(entries, {
-            name = "OEBPS/images",
-            path = disk_dir,
-            recursive = true,
-        })
+    for _, method in ipairs({ "store", "deflate" }) do
+        if #groups[method] > 0 then
+            -- Keep the directory API required by Kindle, but materialize only
+            -- this output's references instead of archiving its source tree.
+            entries[#entries + 1] = {
+                name = "OEBPS/images", assets = groups[method], store = method == "store",
+            }
+        end
     end
 end
 
@@ -433,25 +624,32 @@ end
 -- WeRead EPUB chapters may decode to multiple concatenated XHTML documents.
 -- The first <body> is often a title shell; main content lives in later bodies.
 local function body_fragment(xhtml)
-    xhtml = tostring(xhtml or "")
+    if type(xhtml) == "table" then
+        local file = assert(io.open(assert(xhtml.path, "chapter body path required"), "rb"))
+        local value, err = file:read("*a")
+        file:close()
+        xhtml = assert(value, err or "could not read chapter body")
+    else
+        xhtml = tostring(xhtml or "")
+    end
     local bodies = {}
-    local remaining = xhtml
-    while remaining ~= "" do
-        local body_start = remaining:find("<body", 1, true)
+    local position = 1
+    while position <= #xhtml do
+        local body_start = xhtml:find("<body", position, true)
         if not body_start then
             break
         end
-        local body_open_end = remaining:find(">", body_start, true)
+        local body_open_end = xhtml:find(">", body_start, true)
         if not body_open_end then
             break
         end
-        local body_close = remaining:find("</body>", body_open_end, true)
+        local body_close = xhtml:find("</body>", body_open_end, true)
         if not body_close then
-            bodies[#bodies + 1] = remaining:sub(body_open_end + 1)
+            bodies[#bodies + 1] = xhtml:sub(body_open_end + 1)
             break
         end
-        bodies[#bodies + 1] = remaining:sub(body_open_end + 1, body_close - 1)
-        remaining = remaining:sub(body_close + 7)
+        bodies[#bodies + 1] = xhtml:sub(body_open_end + 1, body_close - 1)
+        position = body_close + 7
     end
     if #bodies > 0 then
         return table.concat(bodies, "\n")
@@ -474,35 +672,36 @@ local function checked_body(response_text)
     return body
 end
 
+local base64_values = {}
+for index = 1, #b64chars do base64_values[b64chars:byte(index)] = index - 1 end
+base64_values[string.byte("-")] = 62
+base64_values[string.byte("_")] = 63
+local base64_scales = { [0] = 1, [2] = 4, [4] = 16 }
+
 local function base64_decode(data)
-    data = data:gsub("-", "+"):gsub("_", "/")
-    local pad = #data % 4
-    if pad > 0 then
-        data = data .. string.rep("=", 4 - pad)
-    end
-    data = data:gsub("[^" .. b64chars .. "=]", "")
-    return (data:gsub(".", function(char)
-        if char == "=" then
-            return ""
-        end
-        local bits = ""
-        local index = b64chars:find(char, 1, true) - 1
-        for bit = 6, 1, -1 do
-            bits = bits .. (index % 2 ^ bit - index % 2 ^ (bit - 1) > 0 and "1" or "0")
-        end
-        return bits
-    end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(bits)
-        if #bits ~= 8 then
-            return ""
-        end
-        local byte = 0
-        for i = 1, 8 do
-            if bits:sub(i, i) == "1" then
-                byte = byte + 2 ^ (8 - i)
+    local buffer, bits, count = 0, 0, 0
+    local bytes, chunks = {}, {}
+    for index = 1, #data do
+        local value = base64_values[data:byte(index)]
+        -- Padding and other non-alphabet bytes were ignored by the original
+        -- bit-string decoder, including padding in the middle of a payload.
+        if value then
+            buffer, bits = buffer * 64 + value, bits + 6
+            if bits >= 8 then
+                bits = bits - 8
+                local scale = base64_scales[bits]
+                count = count + 1
+                bytes[count] = string.char(math.floor(buffer / scale))
+                buffer = buffer % scale
+                if count == 4096 then
+                    chunks[#chunks + 1] = table.concat(bytes, "", 1, count)
+                    count = 0
+                end
             end
         end
-        return string.char(byte)
-    end))
+    end
+    if count > 0 then chunks[#chunks + 1] = table.concat(bytes, "", 1, count) end
+    return table.concat(chunks)
 end
 
 local function swap_positions(encoded)
@@ -544,18 +743,28 @@ local function swap_positions(encoded)
 end
 
 local function reverse_swaps(encoded, positions)
-    local chars = {}
-    for i = 1, #encoded do
-        chars[i] = encoded:sub(i, i)
-    end
+    if #positions == 0 then return encoded end
+    local replacements = {}
     for i = #positions, 1, -2 do
         for k = 1, 0, -1 do
             local left = positions[i] + k + 1
             local right = positions[i - 1] + k + 1
-            chars[left], chars[right] = chars[right], chars[left]
+            local left_value = replacements[left] or encoded:sub(left, left)
+            local right_value = replacements[right] or encoded:sub(right, right)
+            replacements[left], replacements[right] = right_value, left_value
         end
     end
-    return table.concat(chars)
+    local ordered = {}
+    for position in pairs(replacements) do ordered[#ordered + 1] = position end
+    table.sort(ordered)
+    local parts, start = {}, 1
+    for _, position in ipairs(ordered) do
+        if position > start then parts[#parts + 1] = encoded:sub(start, position - 1) end
+        parts[#parts + 1] = replacements[position]
+        start = position + 1
+    end
+    if start <= #encoded then parts[#parts + 1] = encoded:sub(start) end
+    return table.concat(parts)
 end
 
 local function decode_encoded_body(body)
@@ -690,13 +899,18 @@ local function build_ncx_points(chapters, filename_for)
     return render(tree), play_order
 end
 
-function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
+-- Chapter bodies can be strings or { path = staged_xhtml_path } descriptors.
+function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css, options)
+    assets = normalized_assets(assets)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
     book.cache_dir = dir
     local book_title = book.title or "WeRead"
-    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
+    local uid = tostring(chapter.chapterUid or chapter.chapterId or "chapter")
+        :gsub("[^%w_-]", function(char) return string.format("%%%02X", char:byte()) end)
+    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or "Chapter"))
+        .. " - " .. uid .. ".epub"
     local title = chapter.title or book.title or "WeRead"
     local author = book.author or "WeRead"
     local manifest_assets = {}
@@ -754,12 +968,13 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
         { name = "OEBPS/text/chapter.xhtml", data = chapter_xhtml },
     }
     append_asset_entries(entries, assets)
-    write_epub(path, entries)
+    write_epub(path, entries, options)
     Content.register_annotation_document(book, path, { chapter })
     return path
 end
 
-function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
+function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data, options)
+    assets = normalized_assets(assets)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
@@ -786,8 +1001,15 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     local cover_meta = ""
     if cover_data and #cover_data > 0 then
         local ext, mime = media_type_for(cover_data)
+        local used_hrefs = {}
+        for _, asset in ipairs(assets) do used_hrefs[asset.href] = true end
         local cover_img_href = "images/cover" .. ext
-        table.insert(entries, { name = "OEBPS/" .. cover_img_href, data = cover_data })
+        local cover_index = 1
+        while used_hrefs[cover_img_href] do
+            cover_index = cover_index + 1
+            cover_img_href = "images/cover-" .. tostring(cover_index) .. ext
+        end
+        table.insert(entries, { name = "OEBPS/" .. cover_img_href, data = cover_data, store = true })
         table.insert(manifest_items, [[<item id="cover-image" href="]] .. xml_escape(cover_img_href) .. [[" media-type="]] .. xml_escape(mime) .. [[" properties="cover-image"/>]])
         table.insert(manifest_items, [[<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>]])
         table.insert(spine_items, [[<itemref idref="cover"/>]])
@@ -813,7 +1035,9 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
         local id = item_id("chapter_", uid)
         local title = chapter.title or ("Chapter " .. uid)
-        local chapter_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
+        local source = chapter_bodies[uid] or ""
+        local function load_chapter_xhtml()
+            return [[<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="zh-CN">
 <head>
@@ -821,10 +1045,11 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 <link rel="stylesheet" type="text/css" href="../style.css"/>
 </head>
 <body>
-]] .. body_fragment(chapter_bodies[uid] or "") .. [[
+]] .. body_fragment(source) .. [[
 </body>
 </html>]]
-        table.insert(entries, { name = "OEBPS/" .. filename, data = chapter_xhtml })
+        end
+        table.insert(entries, { name = "OEBPS/" .. filename, load = load_chapter_xhtml })
         table.insert(manifest_items, [[<item id="]] .. id .. [[" href="]] .. filename .. [[" media-type="application/xhtml+xml"/>]])
         table.insert(spine_items, [[<itemref idref="]] .. id .. [["/>]])
     end
@@ -881,7 +1106,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
     table.insert(entries, { name = "OEBPS/nav.xhtml", data = nav })
     table.insert(entries, { name = "OEBPS/toc.ncx", data = ncx })
     table.insert(entries, { name = "OEBPS/style.css", data = css })
-    write_epub(path, entries)
+    write_epub(path, entries, options)
     Content.register_annotation_document(book, path, chapters)
     return path
 end
@@ -903,11 +1128,81 @@ function Content.rewrite_image_sources(xhtml, src_map)
     return xhtml
 end
 
-function Content.download_remote_images(client, xhtml, used_names, progress)
+local function fatal_image_request(client)
+    local diagnostic = client.last_request_error
+    if type(diagnostic) ~= "table" then return false end
+    local status = tonumber(diagnostic.status)
+    return status == 401 or status == 403 or status == 429
+        or tonumber(diagnostic.api_code) == -10102
+        or diagnostic.kind == "authentication" or diagnostic.kind == "session"
+        or diagnostic.kind == "cancelled"
+end
+
+local function retryable_image_request(client)
+    local diagnostic = client.last_request_error
+    if type(diagnostic) ~= "table" or diagnostic.retryable ~= true then return false end
+    local status = tonumber(diagnostic.status)
+    return (status and ((status >= 500 and status < 600) or status == 408))
+        or diagnostic.kind == "transport_error" or diagnostic.kind == "transport_timeout"
+        or diagnostic.kind == "total_timeout" or diagnostic.kind == "timeout"
+        or diagnostic.kind == "short_read" or diagnostic.kind == "empty_body"
+end
+
+local function image_request(client, request, cleanup, options, stats)
+    options = options or {}
+    local requested = tonumber(options.attempts) or 3
+    if requested ~= requested then requested = 3 end
+    local attempts = type(options.sleep) == "function"
+        and math.max(1, math.min(3, math.floor(requested))) or 1
+    for attempt = 1, attempts do
+        if options.check_cancelled then options.check_cancelled() end
+        client.last_request_error = nil
+        stats.requests = stats.requests + 1
+        if attempt > 1 then stats.retries = stats.retries + 1 end
+        local ok, value = pcall(request)
+        if ok and type(client.last_request_error) ~= "table" then return true, value, attempt end
+        if ok then value = client.last_request_error.message or "Image request failed" end
+        if cleanup then cleanup() end
+        if fatal_image_request(client) then error(value or "Image request failed", 0) end
+        if attempt == attempts or not retryable_image_request(client) then return false, value, attempt end
+        options.sleep(0.4 * attempt)
+    end
+end
+
+local function check_image_api_response(client, data)
+    if type(data) ~= "string" or not data:match("^%s*{")
+        or type(client.json_decode) ~= "function" then return end
+    local ok, decoded = pcall(client.json_decode, client, data)
+    local code = ok and type(decoded) == "table"
+        and tonumber(decoded.errCode or decoded.errcode or decoded.code)
+    if code == -10102 or code == -2013 or code == -2010 or code == -2012 then
+        local message = "Image request failed: API " .. tostring(code)
+        client.last_request_error = { kind = code == -2013 and "authentication"
+            or (code == -2010 or code == -2012) and "session" or "api_error",
+            api_code = code, status = 200, retryable = false, message = message }
+        error(message, 0)
+    end
+end
+
+local function image_retry_stats()
+    return { requests = 0, retries = 0, recovered_images = 0, failed_images = 0 }
+end
+
+function Content.download_remote_images(client, xhtml, used_names, progress, options)
     local assets = {}
+    local complete = true
+    local included, failed_urls, retry_stats = {}, {}, image_retry_stats()
     used_names = used_names or {}
     used_names.__remote_image_hrefs = used_names.__remote_image_hrefs or {}
+    used_names.__remote_image_assets = used_names.__remote_image_assets or {}
     local remote_image_hrefs = used_names.__remote_image_hrefs
+    local remote_image_assets = used_names.__remote_image_assets
+    local function include(asset)
+        if not included[asset.href] then
+            included[asset.href] = true
+            assets[#assets + 1] = asset
+        end
+    end
     local function remote_url(src)
         local url = tostring(src or "")
         if url:match("^//") then
@@ -924,7 +1219,7 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
         end
     end)
     if img_total == 0 then
-        return xhtml, assets
+        return xhtml, assets, complete, retry_stats
     end
     local index = 0
     local body = xhtml:gsub('src=(["\'])(.-)%1', function(quote, src)
@@ -936,32 +1231,43 @@ function Content.download_remote_images(client, xhtml, used_names, progress)
         if progress then
             progress(index, img_total)
         end
-        local cached_href = remote_image_hrefs[url]
-        if cached_href then
-            return "src=" .. quote .. "../" .. cached_href .. quote
+        if failed_urls[url] then return "src=" .. quote .. src .. quote end
+        local cached_asset = remote_image_assets[url]
+        if cached_asset then
+            include(cached_asset)
+            return "src=" .. quote .. "../" .. cached_asset.href .. quote
         end
-        local ok, data = pcall(function()
+        local ok, data, attempts = image_request(client, function()
             return client:get_binary(url, { referer = "https://weread.qq.com/" })
-        end)
+        end, nil, options, retry_stats)
         if not ok or not data or #data == 0 then
+            complete, failed_urls[url] = false, true
+            retry_stats.failed_images = retry_stats.failed_images + 1
             return "src=" .. quote .. src .. quote
         end
         local ext, mt = media_type_for(data)
         if not mt:match("^image/") then
+            complete, failed_urls[url] = false, true
+            retry_stats.failed_images = retry_stats.failed_images + 1
+            check_image_api_response(client, data)
             return "src=" .. quote .. src .. quote
         end
         local seed = basename((url:match("^[^%?#]+") or url))
         local fname = unique_asset_name(used_names, seed ~= "" and seed or ("img" .. tostring(index)), ext)
         local href = "images/" .. fname
         remote_image_hrefs[url] = href
-        table.insert(assets, {
+        local asset = {
             href = href,
             media_type = mt,
             data = data,
-        })
+            store = true,
+        }
+        remote_image_assets[url] = asset
+        include(asset)
+        if attempts > 1 then retry_stats.recovered_images = retry_stats.recovered_images + 1 end
         return "src=" .. quote .. "../" .. href .. quote
     end)
-    return body, assets
+    return body, assets, complete, retry_stats
 end
 
 function Content.download_chapter_assets(client, book, chapter, used_names)
@@ -1152,11 +1458,21 @@ function Content.download_chapter_assets_to_files(client, book, chapter, used_na
     return assets, src_map
 end
 
-function Content.download_remote_images_to_files(client, xhtml, used_names, workspace, progress)
+function Content.download_remote_images_to_files(client, xhtml, used_names, workspace, progress, options)
     local assets = {}
+    local complete = true
+    local included, failed_urls, retry_stats = {}, {}, image_retry_stats()
     used_names = used_names or {}
     used_names.__remote_image_hrefs = used_names.__remote_image_hrefs or {}
+    used_names.__remote_image_assets = used_names.__remote_image_assets or {}
     local remote_image_hrefs = used_names.__remote_image_hrefs
+    local remote_image_assets = used_names.__remote_image_assets
+    local function include(asset)
+        if not included[asset.href] then
+            included[asset.href] = true
+            assets[#assets + 1] = asset
+        end
+    end
     local function remote_url(src)
         local url = tostring(src or "")
         if url:match("^//") then url = "https:" .. url end
@@ -1172,22 +1488,37 @@ function Content.download_remote_images_to_files(client, xhtml, used_names, work
         if not url then return "src=" .. quote .. src .. quote end
         index = index + 1
         if progress then progress(index, img_total) end
-        local cached_href = remote_image_hrefs[url]
-        if cached_href then return "src=" .. quote .. "../" .. cached_href .. quote end
+        if failed_urls[url] then return "src=" .. quote .. src .. quote end
+        local cached_asset = remote_image_assets[url]
+        if cached_asset then
+            include(cached_asset)
+            return "src=" .. quote .. "../" .. cached_asset.href .. quote
+        end
         local incoming = string.format("%s/remote-%06d.bin", workspace.incoming_dir, index)
-        local ok = pcall(function()
-            client:download_to_file(url, incoming, {
+        local function cleanup()
+            pcall(os.remove, incoming)
+            pcall(os.remove, incoming .. ".part")
+        end
+        local ok, _, attempts = image_request(client, function()
+            return client:download_to_file(url, incoming, {
                 referer = "https://weread.qq.com/",
                 max_bytes = 64 * 1024 * 1024,
             })
-        end)
+        end, cleanup, options, retry_stats)
         if not ok then
-            pcall(os.remove, incoming)
+            complete, failed_urls[url] = false, true
+            retry_stats.failed_images = retry_stats.failed_images + 1
             return "src=" .. quote .. src .. quote
         end
         local ext, mt = media_type_for_file(incoming)
         if not mt or not mt:match("^image/") then
-            pcall(os.remove, incoming)
+            complete, failed_urls[url] = false, true
+            retry_stats.failed_images = retry_stats.failed_images + 1
+            local file = io.open(incoming, "rb")
+            local data = file and file:read(8192)
+            if file then file:close() end
+            cleanup()
+            check_image_api_response(client, data)
             return "src=" .. quote .. src .. quote
         end
         local seed = basename((url:match("^[^%?#]+") or url))
@@ -1196,24 +1527,35 @@ function Content.download_remote_images_to_files(client, xhtml, used_names, work
         local output_path = workspace.asset_dir .. "/" .. fname
         local renamed = os.rename(incoming, output_path)
         if not renamed then
-            pcall(os.remove, incoming)
+            complete, failed_urls[url] = false, true
+            retry_stats.failed_images = retry_stats.failed_images + 1
+            cleanup()
             return "src=" .. quote .. src .. quote
         end
         local file = io.open(output_path, "rb")
         local size = file and file:seek("end") or 0
         if file then file:close() end
+        if not size or size <= 0 then
+            complete, failed_urls[url] = false, true
+            retry_stats.failed_images = retry_stats.failed_images + 1
+            pcall(os.remove, output_path)
+            return "src=" .. quote .. src .. quote
+        end
         local href = "images/" .. fname
         remote_image_hrefs[url] = href
-        table.insert(assets, {
+        local asset = {
             href = href,
             media_type = mt,
             path = output_path,
             size = size,
             store = true,
-        })
+        }
+        remote_image_assets[url] = asset
+        include(asset)
+        if attempts > 1 then retry_stats.recovered_images = retry_stats.recovered_images + 1 end
         return "src=" .. quote .. "../" .. href .. quote
     end)
-    return body, assets
+    return body, assets, complete, retry_stats
 end
 
 function Content.ensure_reader_state(client, book)
@@ -1295,6 +1637,19 @@ function Content.fetch_chapter_shard(client, _settings, book, chapter, endpoint)
     if text == "{}" then
         error(endpoint .. " returned empty object")
     end
+    if type(text) == "string" and text:sub(1, 1) == "{" and type(client.json_decode) == "function" then
+        local decoded, value = pcall(client.json_decode, client, text)
+        local api_code = decoded and type(value) == "table"
+            and tonumber(value.errCode or value.errcode or value.code)
+        if api_code and api_code ~= 0 then
+            local kind = api_code == -2013 and "authentication"
+                or (api_code == -2010 or api_code == -2012) and "session" or "api_error"
+            local message = endpoint .. " failed: API " .. tostring(api_code)
+            client.last_request_error = { kind = kind, api_code = api_code,
+                status = code, retryable = kind == "session", message = message }
+            error(message, 0)
+        end
+    end
     return text
 end
 
@@ -1312,27 +1667,35 @@ function Content.txt_to_xhtml(text)
         .. '<body>\n' .. table.concat(parts, "\n") .. '\n</body></html>'
 end
 
-function Content.fetch_txt_as_xhtml(client, settings, book, chapter)
+function Content.fetch_txt_as_xhtml(client, settings, book, chapter, options)
     local t0 = Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/t_0")
     local ok_t1, t1 = pcall(Content.fetch_chapter_shard, client, settings, book, chapter, "/web/book/chapter/t_1")
-    if not ok_t1 then t1 = "" end
+    if not ok_t1 then
+        local optional_empty = "/web/book/chapter/t_1 returned empty object"
+        if client.last_request_error or tostring(t1):sub(-#optional_empty) ~= optional_empty then
+            error(t1, 0)
+        end
+        t1 = ""
+    end
     local plain = Content.decode_content_shards(t0, t1, "")
-    Content.cache_annotation_source(settings, book, chapter, plain, true)
-    return Content.txt_to_xhtml(plain)
+    if not options or options.persist_source ~= false then
+        Content.cache_annotation_source(settings, book, chapter, plain, true)
+    end
+    return Content.txt_to_xhtml(plain), plain
 end
 
-function Content.fetch_chapter_xhtml(client, settings, book, chapter)
+function Content.fetch_chapter_xhtml(client, settings, book, chapter, options)
     Content.refresh_reader_state(client, book, chapter)
 
     if book._content_format == "txt" then
-        return Content.fetch_txt_as_xhtml(client, settings, book, chapter)
+        return Content.fetch_txt_as_xhtml(client, settings, book, chapter, options)
     end
 
     local ok, e0 = pcall(Content.fetch_chapter_shard, client, settings, book, chapter, "/web/book/chapter/e_0")
 
     if ok and e0:sub(1, 1) == "{" and e0:find('"bookId"', 1, true) then
         book._content_format = "txt"
-        return Content.fetch_txt_as_xhtml(client, settings, book, chapter)
+        return Content.fetch_txt_as_xhtml(client, settings, book, chapter, options)
     end
 
     if not ok then
@@ -1340,11 +1703,12 @@ function Content.fetch_chapter_xhtml(client, settings, book, chapter)
     end
 
     book._content_format = "epub"
-    return Content.decode_content_shards(
+    local xhtml = Content.decode_content_shards(
         e0,
         Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_1"),
         Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_3")
     )
+    return xhtml, xhtml
 end
 
 -- True when the text following the literal "0" of a font-size declaration
@@ -1450,6 +1814,7 @@ function Content.fetch_chapter_css(client, settings, book, chapter)
         end
         return sanitized
     end
+    if client.last_request_error then error(css, 0) end
     return nil
 end
 
@@ -1541,8 +1906,11 @@ end
 -- thought batches cooperatively instead of blocking inside Thoughts.apply().
 function Content.fetch_single_chapter_source(client, settings, book, chapter, state)
     state = state or {}
-    local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-    Content.cache_annotation_source(settings, book, chapter, xhtml)
+    local xhtml, raw_source = Content.fetch_chapter_xhtml(client, settings, book, chapter, state.source_options)
+    state.raw_source = raw_source or xhtml
+    if not state.source_options or state.source_options.persist_source ~= false then
+        Content.cache_annotation_source(settings, book, chapter, xhtml)
+    end
     if not state.css then
         state.css = Content.fetch_chapter_css(client, settings, book, chapter)
     end
@@ -1567,15 +1935,17 @@ function Content.finalize_single_chapter_content(client, settings, book, chapter
             table.insert(chapter_assets, asset)
         end
         xhtml = Content.rewrite_image_sources(xhtml, src_map)
-        local inline_xhtml, inline_assets
+        local inline_xhtml, inline_assets, images_complete, retry_stats
         if state.workspace then
-            inline_xhtml, inline_assets = Content.download_remote_images_to_files(
+            inline_xhtml, inline_assets, images_complete, retry_stats = Content.download_remote_images_to_files(
                 client, xhtml, state.used_asset_names, state.workspace,
-                state.image_progress)
+                state.image_progress, state.retry_options)
         else
-            inline_xhtml, inline_assets = Content.download_remote_images(
-                client, xhtml, state.used_asset_names, state.image_progress)
+            inline_xhtml, inline_assets, images_complete, retry_stats = Content.download_remote_images(
+                client, xhtml, state.used_asset_names, state.image_progress, state.retry_options)
         end
+        if images_complete == false then state.resources_complete = false end
+        state.image_retry_stats = retry_stats
         xhtml = inline_xhtml
         for _, asset in ipairs(inline_assets) do
             table.insert(chapter_assets, asset)

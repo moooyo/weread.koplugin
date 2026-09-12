@@ -18,7 +18,9 @@ local time = require("ui/time")
 local T = require("ffi/util").template
 
 local Content = require("weread.lib.content")
+local Crypto = require("weread.lib.crypto")
 local DownloadDialog = require("weread.ui.download_dialog")
+local DownloadPolicy = require("weread.lib.download_policy")
 local Footnotes = require("weread.lib.footnotes")
 local I18n = require("weread.lib.i18n")
 local StandbyGuard = require("weread.lib.standby_guard")
@@ -27,6 +29,11 @@ local WorkerSettings = require("weread.lib.worker_settings")
 
 local function _(text)
     return I18n.tr(text)
+end
+
+local function configured_concurrency(settings)
+    local cache = settings and type(settings.get) == "function" and settings:get("cache", {}) or {}
+    return DownloadPolicy.concurrency(type(cache) == "table" and cache.chapter_download_concurrency or nil)
 end
 
 local function log_error(err)
@@ -127,9 +134,22 @@ function Downloader:_notifyCompletion(dl, ok, value)
 end
 
 function Downloader:_finishJob(dl)
+    if dl.finished then return end
+    dl.finished = true
     if self._active_job == dl then
         self._active_job = nil
     end
+    local dialog = dl.progress_dialog
+    dl.progress_dialog = nil
+    if dialog then
+        local closed, close_error = pcall(dialog.close, dialog)
+        if not closed then logger.warn("download dialog cleanup failed:", log_error(close_error)) end
+    end
+    for _, callback in ipairs(dl.after_finish or {}) do
+        local ok, err = pcall(callback)
+        if not ok then logger.warn("download drain callback failed:", log_error(err)) end
+    end
+    dl.after_finish = nil
     local pending = self._pending_start
     if pending and not self._active_job then
         self._pending_start = nil
@@ -141,6 +161,129 @@ function Downloader:_finishJob(dl)
             self:start(pending.book, pending.chapters, pending.suffix, pending.options)
         end)
     end
+end
+
+-- Keep source paths and diagnostic traces in logs/callbacks, while presenting
+-- known resumable failures with an action the reader can take.
+function Downloader:pauseMessage(details)
+    if type(details) ~= "table" then return nil end
+    local reason = details.error
+    local known = reason == "low_memory" or reason == "worker_unavailable"
+        or reason == "worker_timeout" or reason == "worker_no_result"
+    if details.pause ~= true and not known then return nil end
+    local message = _("Download paused. Completed chapters have been saved.\nPlease cache the book again later to continue.")
+    local status = tonumber(details.http_status)
+    if status and status >= 400 and status <= 599 then
+        message = message .. "\n\n" .. T(_("Service response: HTTP %1"), tostring(math.floor(status)))
+    end
+    if details.error_kind == "authentication" or status == 401 or status == 403 then
+        message = message .. "\n\n" .. _("Please check your login and book access before continuing.")
+    elseif reason == "low_memory" then
+        message = message .. "\n\n" .. _("Not enough memory. Close other tasks and try again.")
+    elseif reason == "worker_unavailable" then
+        message = message .. "\n\n" .. _("Background downloading is unavailable.")
+    end
+    return message
+end
+
+function Downloader:_rememberPause(dl, details)
+    if not dl or not self:pauseMessage(details) then return end
+    dl.pause_details = { pause = true, error = details.error,
+        http_status = details.http_status, error_kind = details.error_kind, api_code = details.api_code }
+end
+
+function Downloader:isManualDownloading()
+    local job = self._active_job
+    return job ~= nil and not job.prefetch and not job.finished
+end
+
+function Downloader:_abortJob(dl, err, failure_details)
+    if dl.finished then
+        logger.warn("completed download presentation failed:", log_error(err))
+        return
+    end
+    self:_rememberPause(dl, failure_details or { error = err })
+    local function cleanup(fn)
+        local ok, failure = pcall(fn)
+        if not ok then logger.warn("download cleanup failed:", log_error(failure)) end
+    end
+    cleanup(function() self:_releaseStandby(dl) end)
+    cleanup(function() self:_cleanupWorkspace(dl) end)
+    local dialog = dl.progress_dialog
+    dl.progress_dialog = nil
+    if dialog then cleanup(function() dialog:close() end) end
+    logger.err("download step failed:", log_error(err))
+    self:_notifyCompletion(dl, false, err)
+    self:_finishJob(dl)
+    if not dl.prefetch and not dl.cancelled and self.show_info then
+        cleanup(function()
+            self.show_info(self:pauseMessage(dl.pause_details)
+                or T(_("Download failed:\n%1"), display_error(err)))
+        end)
+    end
+end
+
+function Downloader:_cancelActive(reason, on_done)
+    local dl = self._active_job
+    if not dl then
+        if on_done then on_done() end
+        return false
+    end
+    if on_done then
+        dl.after_finish = dl.after_finish or {}
+        dl.after_finish[#dl.after_finish + 1] = on_done
+    end
+    dl.cancelled = true
+    dl.cancel_reason = reason or "cancelled"
+    if dl.worker_handle and self.background_worker then
+        self.background_worker:cancel(dl.worker_handle, dl.cancel_reason)
+    else
+        self:_scheduleGuarded(dl, function() self:_step(dl) end)
+    end
+    return true
+end
+
+function Downloader:cancelAll(reason, on_done)
+    local pending = self._pending_start
+    local scheduled = self._scheduled_start and self._scheduled_start.pending
+    self._pending_start = nil
+    self._scheduled_start = nil
+    local notified = {}
+    local function discard(request)
+        if not request or notified[request] then return end
+        notified[request] = true
+        local callback = request.options and request.options.on_complete
+        if type(callback) == "function" then
+            local ok, err = pcall(callback, false, reason or "cancelled")
+            if not ok then logger.warn("queued download completion callback failed:", log_error(err)) end
+        end
+    end
+    discard(pending)
+    discard(scheduled)
+    return self:_cancelActive(reason, on_done)
+end
+
+function Downloader:cancelBook(book_id, reason)
+    local function matches(pending)
+        local book = pending and pending.book
+        return book and tostring(book.book_id or book.bookId) == tostring(book_id)
+    end
+    local function discarded(pending)
+        local callback = pending.options and pending.options.on_complete
+        if callback then pcall(callback, false, reason or "cancelled") end
+    end
+    if matches(self._pending_start) then
+        local pending = self._pending_start
+        self._pending_start = nil
+        discarded(pending)
+    end
+    if self._scheduled_start and matches(self._scheduled_start.pending) then
+        local pending = self._scheduled_start.pending
+        self._scheduled_start = nil
+        discarded(pending)
+    end
+    if matches(self._active_job) then return self:_cancelActive(reason) end
+    return false
 end
 
 function Downloader:_cancelScheduledPrefetch(reason)
@@ -248,6 +391,9 @@ function Downloader:_ensureProgressDialog(dl)
                     else
                         dl.cancelled = true
                         dl.cancel_reason = dl.cancel_reason or "cancelled"
+                        if dl.worker_handle and self.background_worker then
+                            self.background_worker:cancel(dl.worker_handle, dl.cancel_reason)
+                        end
                     end
                     if dl.progress_dialog then
                         dl.progress_dialog:close()
@@ -323,6 +469,7 @@ function Downloader:_applyPrefetchResult(dl, result)
     end
 
     local value = result.value
+    self:_publishWorkerOutput(dl, value)
     if value.auth and not WorkerSettings.merge(self.settings,
         dl.auth_fingerprint, value.auth) then
         logger.info("skip worker auth write-back: parent auth changed")
@@ -349,7 +496,8 @@ function Downloader:_applyPrefetchResult(dl, result)
     books[book_id] = record
     self.settings:set("books", books)
     self.settings:flush()
-    self.refresh_shelf()
+    local refreshed, refresh_error = pcall(self.refresh_shelf)
+    if not refreshed then logger.warn("prefetch shelf refresh failed:", log_error(refresh_error)) end
     logger.info("prefetch worker completed:", "book_id=", book_id,
         "chapter_uid=", uid, "path=", value.path)
     self:_notifyCompletion(dl, true, value.path)
@@ -369,6 +517,7 @@ function Downloader:_startPrefetchWorker(dl)
     local ok, handle = worker:start {
         queue = true,
         replace_active = true,
+        book_id = tostring(dl.book.book_id or dl.book.bookId),
         timeout = 180,
         task = function(context)
             return ChapterWorker.run(self.settings, self.client, dl.book,
@@ -376,6 +525,7 @@ function Downloader:_startPrefetchWorker(dl)
         end,
         on_launch = function(pid, available_kb)
             if self._active_job ~= dl then return end
+            dl.auth_fingerprint = WorkerSettings.fingerprint(self.settings)
             self:_beginStandby()
             dl.standby_guard = true
             logger.info("prefetch worker started:", "pid=", tostring(pid),
@@ -385,7 +535,9 @@ function Downloader:_startPrefetchWorker(dl)
             if self._active_job == dl then self:_prefetchStage(dl, state) end
         end,
         on_done = function(result)
-            self:_applyPrefetchResult(dl, result)
+            local success, err = xpcall(function() self:_applyPrefetchResult(dl, result) end,
+                debug.traceback)
+            if not success then self:_abortJob(dl, err) end
         end,
     }
     if ok then
@@ -399,22 +551,177 @@ end
 -- the standby guard, closes the progress dialog, and reports the failure.
 function Downloader:_scheduleGuarded(dl, step_fn, delay)
     UIManager:scheduleIn(delay or 0.1, function()
+        if dl.finished then return end
         local ok, err = xpcall(step_fn, debug.traceback)
-        if not ok and dl.standby_guard then
-            self:_releaseStandby(dl)
-            self:_cleanupWorkspace(dl)
-            if dl.progress_dialog then
-                dl.progress_dialog:close()
-                dl.progress_dialog = nil
-            end
-            logger.err("download step failed:", log_error(err))
-            self:_notifyCompletion(dl, false, err)
-            self:_finishJob(dl)
-            if not dl.prefetch then
-                self.show_info(T(_("Download failed:\n%1"), display_error(err)))
-            end
-        end
+        if not ok then self:_abortJob(dl, err) end
     end)
+end
+
+-- The UI process publishes only a still-current worker result. Unique flat
+-- filenames preserve existing scanner/move support without replacing an open
+-- edition. Renames are local filesystem operations; archive work stays outside
+-- the UI process.
+function Downloader:_publishWorkerOutput(dl, value)
+    if not value.publication_key or not value.path then return end
+    local factory = self.download_store_factory or function(settings, book)
+        return require("weread.lib.download_store"):new(settings, book)
+    end
+    local store = assert(factory(self.settings, dl.book))
+    local moved = {}
+    local old_path, old_chapter_paths = value.path, value.chapter_paths
+    local ok, err = xpcall(function()
+        local prefix = store.book_dir .. "/"
+        local targets = {}
+        local function relocate(path, chapter_uid)
+            assert(path:sub(1, #prefix) == prefix, "Worker output is outside the book cache")
+            local relative = path:sub(#prefix + 1)
+            if not relative:find("/", 1, true) then return path end
+            assert(relative:sub(1, 13) == ".weread-jobs/", "Unexpected worker output directory")
+            if targets[path] then return targets[path] end
+            local identity = Crypto.sha256_hex(path):sub(1, 20)
+            local name = chapter_uid and ("chapter-" .. tostring(chapter_uid):gsub("[^%w_-]", "_") .. "-") or "full-"
+            local destination = prefix .. name .. identity .. ".epub"
+            assert(not file_exists(destination), "Immutable EPUB output already exists")
+            assert(os.rename(path, destination))
+            moved[#moved + 1] = { source = path, destination = destination }
+            targets[path] = destination
+            return destination
+        end
+        if old_chapter_paths and next(old_chapter_paths) then
+            value.chapter_paths = {}
+            for uid, path in pairs(old_chapter_paths) do value.chapter_paths[uid] = relocate(path, uid) end
+            value.path = assert(targets[old_path] or old_path)
+        else value.path = relocate(old_path) end
+        value.cache_dir = store.book_dir
+        if #moved > 0 then
+            value.size, value.chapter_sizes = nil, nil
+            assert(store:putPublication(value.publication_key, value))
+        end
+    end, debug.traceback)
+    if not ok then
+        for index = #moved, 1, -1 do os.rename(moved[index].destination, moved[index].source) end
+        value.path, value.chapter_paths = old_path, old_chapter_paths
+    end
+    pcall(store.close, store)
+    if not ok then error(err, 0) end
+end
+
+function Downloader:_startBookWorker(dl)
+    local worker = self.background_worker
+    if dl.finished then return false end
+    if dl.cancelled then self:_step(dl); return false end
+    self:_ensureProgressDialog(dl)
+    if not dl.standby_guard then
+        self:_beginStandby()
+        dl.standby_guard = true
+    end
+    -- Existing read reporting owns an independent subprocess. Let it finish
+    -- before creating chapter workers; the active manual job blocks new
+    -- automatic reports while we wait. Cancellation still uses normal cleanup.
+    if type(self.is_reporting) == "function" and self.is_reporting() then
+        dl.report_wait_started = dl.report_wait_started or os.time()
+        if os.time() - dl.report_wait_started >= 210 then
+            self:_abortJob(dl, _("Reading sync did not finish. Please retry the download."))
+            return false
+        end
+        self:_setStage(dl, _("Waiting for reading sync to finish..."), 0)
+        self:_scheduleGuarded(dl, function() self:_startBookWorker(dl) end, 0.25)
+        return true
+    end
+    dl.report_wait_started = nil
+    local function done(result)
+        if self._active_job ~= dl or dl.finished then return end
+        dl.worker_handle = nil
+        if dl.cancelled then self:_step(dl); return end
+        if not result or not result.ok or type(result.value) ~= "table" then
+            self:_abortJob(dl, result and result.error or "worker_no_result", result)
+            return
+        end
+        local value = result.value
+        self:_publishWorkerOutput(dl, value)
+        if value.auth then WorkerSettings.merge(self.settings, dl.auth_fingerprint, value.auth) end
+        local by_uid = {}
+        for _, chapter in ipairs(dl.chapters) do
+            by_uid[tostring(chapter.chapterUid or chapter.chapterId)] = chapter
+        end
+        dl.selected = {}
+        for _, chapter_uid in ipairs(value.selected_uids or {}) do
+            local chapter = by_uid[tostring(chapter_uid)]
+            if chapter then dl.selected[#dl.selected + 1] = chapter end
+        end
+        dl.failed = value.failed_uids or {}
+        dl.footnote_stats = value.footnote_stats or dl.footnote_stats
+        dl.footnotes_done = true
+        dl.worker_output = value
+        dl.book.cache_dir = value.cache_dir or dl.book.cache_dir
+        if value.chapter_paths and next(value.chapter_paths) then
+            for _, chapter in ipairs(dl.selected) do
+                local path = value.chapter_paths[tostring(chapter.chapterUid or chapter.chapterId)]
+                if path then Content.register_annotation_document(dl.book, path, { chapter }) end
+            end
+        elseif value.path then
+            Content.register_annotation_document(dl.book, value.path, dl.selected)
+        end
+        dl.index = dl.total + 1
+        self:_step(dl)
+    end
+    local concurrency = dl.download_concurrency
+        or configured_concurrency(self.settings)
+    dl.download_concurrency = concurrency
+    local download_options = { suffix = dl.suffix, single_chapter = dl.single_chapter,
+        separate_chapters = dl.separate_chapters, concurrency = concurrency }
+    local request_options = {
+        queue = true,
+        preserve_queue = true,
+        book_id = tostring(dl.book.book_id or dl.book.bookId),
+        timeout = 360,
+        on_launch = function() dl.auth_fingerprint = WorkerSettings.fingerprint(self.settings) end,
+        on_progress = function(state)
+            if self._active_job ~= dl or dl.cancelled then return end
+            self:_rememberPause(dl, state)
+            local index = math.max(1, tonumber(state.index) or 1)
+            local title = T(_("Downloading chapter %1/%2: %3"), tostring(index),
+                tostring(dl.total), (dl.chapters[index] or {}).title or "")
+            if (tonumber(state.concurrency) or 1) > 1 then
+                title = T(_("Caching chapters: %1/%2 (%3 active)"), tostring(state.completed or 0),
+                    tostring(dl.total), tostring(state.active or 0))
+            end
+            if state.stage == "epub" then title = _("Building EPUB...")
+            elseif state.stage == "footnotes" then
+                title = T(_("Processing footnotes · chapter %1/%2"), tostring(index), tostring(dl.total))
+            elseif state.stage == "images" then
+                title = T(_("Downloading images · chapter %1/%2"), tostring(index), tostring(dl.total))
+            elseif state.stage == "cached" then
+                title = T(_("Reusing cached chapter %1/%2"), tostring(index), tostring(dl.total))
+            elseif state.stage == "retry" then
+                title = T(_("Retrying chapter %1/%2 (attempt %3/%4)"), tostring(index), tostring(dl.total),
+                    tostring(state.attempt or 2), tostring(state.attempts or DownloadPolicy.MAX_ATTEMPTS))
+            end
+            self:_setStage(dl, title, math.min(dl.total, tonumber(state.completed) or index - 1))
+        end,
+        on_done = function(result)
+            local success, err = xpcall(function() done(result) end, debug.traceback)
+            if not success then self:_abortJob(dl, err) end
+        end,
+    }
+    local ok, handle
+    if type(worker.startGroup) == "function" and concurrency > 1 and dl.total > 1 then
+        request_options.concurrency = concurrency
+        request_options.start = function(group)
+            require("weread.lib.book_download_coordinator").start(
+                group, self.settings, self.client, dl.book, dl.chapters, download_options)
+        end
+        ok, handle = worker:startGroup(request_options)
+    else
+        request_options.task = function(context)
+            return require("weread.lib.book_download_worker").run(
+                self.settings, self.client, dl.book, dl.chapters, download_options, context)
+        end
+        ok, handle = worker:start(request_options)
+    end
+    if ok and not dl.finished then dl.worker_handle = handle end
+    if not ok and not dl.finished then self:_abortJob(dl, handle or "worker_unavailable") end
+    return ok
 end
 
 -- Public entry: start downloading the given chapters as one EPUB.
@@ -518,6 +825,7 @@ function Downloader:start(book, chapters, suffix, options)
         offer_read = options.offer_read ~= false,
         silent_completion = options.silent_completion == true,
         prefetch = options.prefetch == true,
+        download_concurrency = configured_concurrency(self.settings),
         start_delay = tonumber(options.start_delay) or 0,
         on_start = options.on_start,
         on_complete = options.on_complete,
@@ -555,6 +863,11 @@ function Downloader:start(book, chapters, suffix, options)
         if dl.cancelled then
             self:_notifyCompletion(dl, false, dl.cancel_reason or "cancelled")
             self:_finishJob(dl)
+            return
+        end
+        if self.background_worker and self.background_worker:available() then
+            notifyStart()
+            self:_startBookWorker(dl)
             return
         end
         local ok_init, err_init = pcall(function()
@@ -602,13 +915,15 @@ function Downloader:start(book, chapters, suffix, options)
 end
 
 function Downloader:_setStage(dl, title, progress)
+    local changed_title = dl.stage_title ~= title
+    local changed_progress = progress ~= nil and dl.stage_progress ~= progress
     dl.stage_title = title
     dl.stage_progress = progress
     if not dl.progress_dialog then return end
-    dl.progress_dialog:setTitle(title)
-    if progress then
+    if changed_progress then
         dl.progress_dialog:reportProgress(progress)
     end
+    if changed_title then dl.progress_dialog:setTitle(title) end
 end
 
 function Downloader:_perf(dl, stage, started, ...)
@@ -811,6 +1126,7 @@ function Downloader:_finishChapter(dl)
 end
 
 function Downloader:_step(dl)
+    if dl.finished then return end
     if dl.cancelled then
         self:_releaseStandby(dl)
         self:_cleanupWorkspace(dl)
@@ -842,7 +1158,7 @@ function Downloader:_step(dl)
         -- to succeed under the stable `full.epub` path makes KOReader present a
         -- structurally valid but truncated book and replaces any previous good
         -- cache. Explicit single- or multi-chapter jobs remain best-effort.
-        if dl.suffix == "full" and #dl.failed > 0 then
+        if dl.suffix == "full" and (#dl.failed > 0 or #dl.selected ~= dl.total) then
             if dl.progress_dialog then
                 dl.progress_dialog:close()
                 dl.progress_dialog = nil
@@ -871,6 +1187,10 @@ function Downloader:_step(dl)
         self:_setStage(dl, _("Building EPUB..."), dl.total)
         local save_started = time.now()
         local ok, path, chapter_paths = pcall(function()
+            if dl.worker_output then
+                assert(file_exists(dl.worker_output.path), "Background EPUB output is missing")
+                return dl.worker_output.path, dl.worker_output.chapter_paths
+            end
             if dl.single_chapter then
                 local chapter = dl.selected[1]
                 local uid = tostring(chapter.chapterUid or 1)
@@ -918,6 +1238,9 @@ function Downloader:_step(dl)
                 record = {}
                 for key, value in pairs(dl.book) do record[key] = value end
             end
+            if ok and not dl.single_chapter and not dl.separate_chapters then
+                dl.previous_full_path = record.cached_full_book or record.cached_file
+            end
             local function apply_cache_result(target)
                 target.annotation_documents = dl.book.annotation_documents or target.annotation_documents
                 target.cached_chapters = target.cached_chapters or {}
@@ -956,7 +1279,8 @@ function Downloader:_step(dl)
             self.settings:set("books", books)
             self.settings:flush()
         end
-        self.refresh_shelf()
+        local refreshed, refresh_error = pcall(self.refresh_shelf)
+        if not refreshed then logger.warn("download shelf refresh failed:", log_error(refresh_error)) end
         if not ok then
             logger.err("save downloaded book failed:", log_error(path))
             self:_notifyCompletion(dl, false, path)
@@ -977,6 +1301,10 @@ function Downloader:_step(dl)
                 end
                 if not ReadCollection.coll[COLLECTION_NAME] then
                     ReadCollection:addCollection(COLLECTION_NAME)
+                end
+                if dl.previous_full_path and dl.previous_full_path ~= path
+                    and ReadCollection.removeItem then
+                    ReadCollection:removeItem(dl.previous_full_path, COLLECTION_NAME, true)
                 end
                 if not ReadCollection:isFileInCollection(path, COLLECTION_NAME) then
                     ReadCollection:addItem(path, COLLECTION_NAME)
@@ -1007,6 +1335,9 @@ function Downloader:_step(dl)
                 _("%1 thought batch(es) failed after retries; the EPUB contains the remaining available thoughts."),
                 tostring(dl.annotation_failed_batches)
             )
+        end
+        if dl.worker_output and dl.worker_output.resources_complete == false then
+            completion_text = completion_text .. "\n\n" .. _("Some images could not be downloaded. Download again to retry the affected chapters.")
         end
         if dl.footnote_stats and dl.footnote_stats.unresolved > 0 then
             completion_text = completion_text .. "\n\n" .. T(

@@ -1,8 +1,10 @@
 package.path = "./?.lua;" .. package.path
 
+local item_builds = 0
 package.preload["weread.lib.annotations"] = function()
     return {
         buildThoughtPopupItems = function(review)
+            item_builds = item_builds + 1
             return { { content = review.pageReviews[1].review.content } }
         end,
     }
@@ -53,5 +55,37 @@ expect(records[3].pos0 == "xp3" and records[3].items[1].content == "想法",
     "review abstract fallback or popup items were not preserved")
 expect(stats.total == 3 and stats.located == 3 and stats.unmatched == 0,
     "locator statistics are incorrect")
+
+local first_review = { range = "8-9", pageReviews = {
+    { review = { abstract = "first", content = "first content" } },
+} }
+local duplicate_review = { range = "8-9", pageReviews = {
+    { review = { abstract = "second", content = "second content" } },
+} }
+local review_list = { false, first_review, duplicate_review }
+local lookup = External.build_review_lookup(review_list)
+expect(lookup["8-9"] == first_review, "review lookup changed first-match duplicate semantics")
+expect(External.quote_for({ range = "8-9" }, review_list) == "first",
+    "legacy review-list quotation changed")
+expect(External.quote_for({ range = "8-9" }, nil, lookup) == "first",
+    "prebuilt review lookup was not used")
+expect(External.quote_for({ range = "8-9", markText = "direct" }, nil, lookup) == "direct",
+    "review lookup replaced the underline's own quotation")
+expect(External.quote_for({ range = "8-9" }, review_list, {}) == "",
+    "an explicitly empty lookup unexpectedly scanned the original list")
+
+local previous_builds = item_builds
+-- Give the existing fixture a known search result without depending on item text.
+local light_document = {
+    findAllText = function() return { { start = "xp1", ["end"] = "xp1e" } } end,
+    getPosFromXPointer = document.getPosFromXPointer,
+}
+local light_records = External.locate(light_document, { {
+    book_id = "7", chapter_uid = "2", underlines = { { range = "8-9" } },
+    reviews = { first_review },
+} }, { include_items = false })
+expect(#light_records == 1 and light_records[1].text == "first" and light_records[1].items == nil,
+    "lightweight matching lost the quotation or retained popup items")
+expect(item_builds == previous_builds, "lightweight matching constructed discarded popup items")
 
 print(("external_annotations_spec: %d checks"):format(checks))

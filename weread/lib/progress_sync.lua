@@ -68,6 +68,7 @@ function ProgressSync:new(options)
         goto_fraction = options.goto_fraction,
         open_chapter = options.open_chapter,
         is_online = options.is_online or function() return true end,
+        is_downloading = options.is_downloading or function() return false end,
         on_choice = options.on_choice or function(context)
             context.keep_local()
         end,
@@ -76,6 +77,7 @@ function ProgressSync:new(options)
         state = "idle",
         generation = 0,
         pull_retry_token = 0,
+        automatic_uploads = {},
         dirty = false,
         verified = false,
     }
@@ -337,25 +339,109 @@ function ProgressSync:_apply_remote(remote, context, options)
     return true
 end
 
-function ProgressSync:_upload_snapshot(position, reason, show_result)
+-- Session cookies may rotate when a download finishes. Fence deferred work
+-- with account identity instead, so normal renewal retains a pending upload.
+function ProgressSync:_upload_identity()
+    local account = self.settings:get("account", {}) or {}
+    local cookies = self.settings:get("cookies", {}) or {}
+    return {
+        user_vid = tostring(account.user_vid or ""),
+        login_time = tostring(account.login_time or ""),
+        cookie_vid = tostring(cookies.wr_vid or ""),
+        api_key = tostring(self.settings:get("api_key", "")),
+        connected = self.settings:is_cookie_configured() == true,
+    }
+end
+
+function ProgressSync:_automatic_upload_current(pending)
+    if self.automatic_uploads[pending.book_id] ~= pending then return false end
+    local identity = self:_upload_identity()
+    for key, value in pairs(pending.identity) do
+        if identity[key] ~= value then
+            self.automatic_uploads[pending.book_id] = nil
+            local book = (self.settings:get("books", {}) or {})[pending.book_id]
+            if book and PositionMapper.same_position(book.pending_upload_position, pending.position, 0)
+                and book.pending_upload_position.captured_at == pending.position.captured_at then
+                self:_persist(pending.book_id, {
+                    pending_upload_position = false, pending_upload_reason = false,
+                })
+            end
+            return false
+        end
+    end
+    return true
+end
+
+function ProgressSync:_defer_automatic_upload(pending)
+    if pending.scheduled then return end
+    pending.scheduled = true
+    self.scheduler:scheduleIn(BUSY_RETRY_SECONDS, function()
+        pending.scheduled = false
+        if not self:_automatic_upload_current(pending) then return end
+        self:_upload_snapshot(pending.position, pending.reason, false, pending)
+    end)
+end
+
+function ProgressSync:_upload_snapshot(position, reason, show_result, pending)
     if type(position) ~= "table" then return false end
     local book_id = tostring(position.book_id or self.current_book_id or "")
-    if book_id == "" or self.uploading then return false end
-    self:_persist(book_id, {
-        pending_upload_position = position,
-        pending_upload_reason = reason or "unspecified",
-    })
+    if book_id == "" then return false end
+    local automatic = reason == "document_close" or reason == "suspend"
+    local replay = pending ~= nil
+    if automatic then
+        if pending then
+            if not self:_automatic_upload_current(pending) then return false end
+        else
+            pending = { book_id = book_id, position = copy(position), reason = reason,
+                identity = self:_upload_identity(), generation = self.generation, attempts = 0 }
+            self.automatic_uploads[book_id] = pending
+        end
+        position = pending.position
+    else
+        -- An explicit position replaces any older automatic snapshot for the
+        -- same book, even while the automatic task is waiting for a download.
+        self.automatic_uploads[book_id] = nil
+        if self.uploading then return false end
+    end
+    if not replay then
+        self:_persist(book_id, {
+            pending_upload_position = position,
+            pending_upload_reason = reason or "unspecified",
+        })
+    end
+    if automatic and (self.is_downloading() or self.uploading) then
+        self:_defer_automatic_upload(pending)
+        return false
+    end
     if not self.is_online() then
+        if automatic then self.automatic_uploads[book_id] = nil end
         self.state = "offline"
         if show_result then self.notify("offline", {}) end
         return false
     end
+    local owner, previous_state = {}, self.state
+    self.upload_owner = owner
     self.uploading = true
     self.state = "uploading"
-    local attempts = 0
+    local function release()
+        if self.upload_owner ~= owner then return end
+        self.upload_owner, self.uploading = nil, false
+        if self.state == "uploading" then self.state = previous_state end
+    end
+    local attempts = automatic and pending.attempts or 0
     local attempt
     attempt = function()
+        if self.upload_owner ~= owner then return end
+        if automatic then
+            if not self:_automatic_upload_current(pending) then release(); return end
+            if self.is_downloading() then
+                release()
+                self:_defer_automatic_upload(pending)
+                return
+            end
+        end
         attempts = attempts + 1
+        if automatic then pending.attempts = attempts end
         local ok, accepted, outcome = pcall(
             self.upload_position,
             book_id,
@@ -368,10 +454,15 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
             self.scheduler:scheduleIn(BUSY_RETRY_SECONDS, attempt)
             return
         end
-        self.uploading = false
+        release()
+        if automatic then self.automatic_uploads[book_id] = nil end
         if ok and accepted then
-            self.state = "verified"
-            self.dirty = false
+            if not automatic or (pending.generation == self.generation
+                and tostring(self.current_book_id or "") == book_id
+                and PositionMapper.same_position(self.local_position, position)) then
+                self.state = "verified"
+                self.dirty = false
+            end
             self.last_uploaded_position = copy(position)
             self:_persist(book_id, {
                 last_local_position = position,
@@ -405,7 +496,8 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
     end
     local started = self.run_online("progress_upload", attempt)
     if not started then
-        self.uploading = false
+        release()
+        if automatic then self.automatic_uploads[book_id] = nil end
         self.state = "offline"
     end
     return started == true
@@ -501,6 +593,19 @@ function ProgressSync:_resolve(local_position, remote, context, options)
     end
 end
 
+function ProgressSync:_defer_automatic_pull(options, retry_token)
+    local pending = { generation = self.generation, retry_token = retry_token, options = copy(options) }
+    pending.options.retry_token = retry_token
+    self.deferred_pull = pending
+    self.scheduler:scheduleIn(BUSY_RETRY_SECONDS, function()
+        if self.deferred_pull ~= pending then return end
+        self.deferred_pull = nil
+        if pending.generation ~= self.generation or retry_token ~= self.pull_retry_token then return end
+        if self.verified or self.pulling or self.state == "awaiting_choice" then return end
+        self:_pull(pending.options)
+    end)
+end
+
 function ProgressSync:_schedule_pull_retry(options, retry_token)
     local attempt = (options.retry or 0) + 1
     if attempt > PULL_MAX_RETRIES then
@@ -537,6 +642,11 @@ function ProgressSync:_pull(options)
     elseif retry_token ~= self.pull_retry_token then
         return false
     end
+    if options.manual ~= true and self.is_downloading() then
+        self.state = "waiting"
+        self:_defer_automatic_pull(options, retry_token)
+        return false
+    end
     local local_position, reason, context = self:capture_local()
     if not local_position then
         if not (options.manual == true
@@ -567,6 +677,17 @@ function ProgressSync:_pull(options)
     self.pulling = true
     self.state = "pulling"
     local started = self.run_online("progress_pull", function()
+        if generation ~= self.generation or retry_token ~= self.pull_retry_token
+            or (context and tostring(self.detect_book() or "") ~= context.book_id) then
+            self.pulling = false
+            return
+        end
+        if options.manual ~= true and self.is_downloading() then
+            self.pulling = false
+            self.state = "waiting"
+            self:_defer_automatic_pull(options, retry_token)
+            return
+        end
         if not local_position then
             local book_id = tostring(self.detect_book() or "")
             local refresh_ok, refreshed, refresh_error = pcall(

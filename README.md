@@ -108,6 +108,7 @@ koreader/plugins/weread.koplugin/
 │   │   ├── 打开时拉取进度（默认关闭）
 │   │   └── 关闭时上传进度（默认关闭）
 │   ├── 下载设置
+│   │   ├── Concurrent chapter downloads: 5 (1–5; applies to new jobs)
 │   │   ├── 书籍图片（默认开启）
 │   │   ├── 公众号文章图片（默认关闭）
 │   │   ├── 隐藏脚注文本（默认关闭；开启需同时启用 KOReader 脚注弹框；仅影响新下载书籍）
@@ -154,6 +155,30 @@ XPointer 外部标注层仍是实验性功能，测试步骤和限制见
 `fonts/NotoEmoji-Regular.ttf` 是第三方字体，采用 [SIL Open Font License 1.1](fonts/LICENSE)，不适用本项目的 AGPL-3.0。
 
 Copyright © 2026 finlater and contributors.
+
+## Download recovery
+
+On platforms supported by KOReader's subprocess runner, manual downloads use
+up to five concurrent chapter workers by default. Select 1–5 under Settings →
+Download settings → Concurrent chapter downloads. A new value applies only to
+jobs started afterward. Chapter prefetch shares the background worker budget. Completed
+chapter sources and resources are stored under the book's `.weread-jobs`
+directory and reused after interruption or when changing the output mode.
+Each EPUB is assembled from its referenced resources; full-book output is
+published only when all requested chapters succeed. Cache cleanup removes the
+associated recovery data after active writers have stopped.
+
+Temporary chapter and background image failures are retried up to three times
+in total. Chapter retry waits release their worker slot. Authentication,
+upstream rejection, and persistent network failures pause the job; caching
+again reuses completed chapters. A configured concurrency of one keeps the
+serial worker path. Available memory can reduce the number of active workers.
+
+Annotations are downloaded in persisted batches, then matched locally against
+the opened document. Platforms without the worker backend retain a foreground
+compatibility path. The chapter concurrency limit does not enable parallel
+annotation API requests. Design and validation details are tracked in
+[the optimization plan](docs/download-optimization-plan.md).
 
 ## 项目推荐
 

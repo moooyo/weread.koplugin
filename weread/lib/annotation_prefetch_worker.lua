@@ -5,7 +5,8 @@ local WorkerSettings = require("weread.lib.worker_settings")
 
 local M = {}
 
-function M.run(settings, client, context, chapters, worker_context)
+function M.run(settings, client, context, chapters, worker_context, options)
+    options = options or {}
     local auth_result = WorkerSettings.capture(settings)
     local source_book = context.book or {
         bookId = context.book_id,
@@ -21,8 +22,9 @@ function M.run(settings, client, context, chapters, worker_context)
         ranges = context.ranges,
         document = nil,
         document_key = nil,
-        refresh = false,
+        refresh = options.refresh == true,
         offline = false,
+        check_cancelled = worker_context.checkCancelled,
         fetch_source = function(chapter)
             local html = Content.fetch_chapter_xhtml(client, settings,
                 source_book, chapter)
@@ -33,16 +35,37 @@ function M.run(settings, client, context, chapters, worker_context)
             return html
         end,
     }
-    while true do
-        worker_context.checkCancelled()
-        local done, state = job:step()
-        if done == nil then error(state, 0) end
-        if done then return { auth = auth_result() } end
-        worker_context.emit(state)
-        if state and tonumber(state.delay) and tonumber(state.delay) > 0 then
-            worker_context.sleep(state.delay)
-        end
+    local progress, last_activity = {}, 0
+    local previous
+    if client.set_request_context then
+        previous = client:set_request_context {
+            cancelled = worker_context.cancelled,
+            on_progress = function(info)
+                worker_context.checkCancelled()
+                if os.time() ~= last_activity then
+                    last_activity = os.time()
+                    progress.bytes = tonumber(info.bytes) or 0
+                    worker_context.emit(progress)
+                end
+            end,
+        }
     end
+    local ok, result = xpcall(function()
+        while true do
+            worker_context.checkCancelled()
+            local done, state = job:step()
+            if done == nil then error(state, 0) end
+            if done then return { auth = auth_result() } end
+            progress = state
+            worker_context.emit(state)
+            if state and tonumber(state.delay) and tonumber(state.delay) > 0 then
+                worker_context.sleep(state.delay)
+            end
+        end
+    end, debug.traceback)
+    if client.set_request_context then client:set_request_context(previous) end
+    if not ok then error(result, 0) end
+    return result
 end
 
 return M

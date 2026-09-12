@@ -97,6 +97,13 @@ function M:closeWeReadUI()
 end
 
 function M:onWeReadAccountChanged()
+    if self.downloader and self.downloader.cancelAll then
+        self.downloader:cancelAll("account_changed")
+    end
+    if self._cancelUnifiedAnnotationSync then self:_cancelUnifiedAnnotationSync() end
+    if self.prefetch_worker and self.prefetch_worker.cancelAll then
+        self.prefetch_worker:cancelAll("account_changed")
+    end
     self:closeWeReadUI()
     self.shelf_regular = nil
     self.shelf_mp = nil
@@ -690,7 +697,11 @@ function M:showBookMenu(book)
             end
         end
     end
-    local saved = self.settings:get("books", {})[book_id] or book
+    local saved_books = self.settings:get("books", {})
+    local saved = saved_books[book_id] or saved_books[tostring(book_id)] or book
+    if saved ~= book then
+        for field in pairs(local_cache_fields) do book[field] = saved[field] end
+    end
     local cached_path = self:getFullBookCachePath(saved)
     local is_full_cached = file_exists(cached_path)
     local has_cache = self:bookRecordHasDownload(saved)
@@ -814,6 +825,12 @@ function M:showBookMenu(book)
             self:refreshBookRecord(book, view)
         end),
     })
+    view._weread_book_id = tostring(book_id)
+    local on_close_widget = view.onCloseWidget
+    view.onCloseWidget = function(widget, ...)
+        if self._book_detail_view == widget then self._book_detail_view = nil end
+        if on_close_widget then return on_close_widget(widget, ...) end
+    end
     self._book_detail_view = view
     return view
 end
@@ -1543,13 +1560,32 @@ end
 -- Annotation matching is a reading action, shared by all download forms.
 function M:confirmAndDownloadChapters(book, chapters, suffix, options)
     options = options or {}
+    local download_options = {}
+    for key, value in pairs(options) do download_options[key] = value end
+    local book_id = book.book_id or book.bookId
+    local detail = self._book_detail_view
+    if detail and detail._weread_book_id == tostring(book_id) then
+        local on_complete = options.on_complete
+        download_options.on_complete = function(ok, ...)
+            if on_complete then on_complete(ok, ...) end
+            if not ok or options.open_on_complete or self._book_detail_view ~= detail then return end
+            if UIManager.getTopmostVisibleWidget and UIManager:getTopmostVisibleWidget() ~= detail then return end
+            -- The downloader persists cache paths before this callback and
+            -- shows its completion dialog afterwards. Refresh synchronously
+            -- so the updated detail stays beneath that dialog.
+            local books = self.settings:get("books", {})
+            local latest = books[book_id] or books[tostring(book_id)] or book
+            UIManager:close(detail)
+            self:showBookMenu(latest)
+        end
+    end
     local text = options.confirmation_text
         or T(_("Download %1 selected chapter(s)?"), tostring(#chapters))
     UIManager:show(ConfirmBox:new{
         text = text,
         ok_text = _("Download"), cancel_text = _("Cancel"),
         ok_callback = self:safeCallback(_("Download"), function()
-            self.downloader:start(book, chapters, suffix, options)
+            self.downloader:start(book, chapters, suffix, download_options)
         end),
     })
 end

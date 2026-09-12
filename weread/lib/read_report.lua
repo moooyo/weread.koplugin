@@ -180,6 +180,7 @@ function ReadReport:new(options)
         detect_book = options.detect_book,
         position_provider = options.position_provider,
         is_online = options.is_online or function() return true end,
+        is_downloading = options.is_downloading or function() return false end,
         now = options.now or os.time,
         session_id = tostring({}) .. ":" .. tostring((options.now or os.time)()),
         subprocess = options.subprocess or make_subprocess_runner(),
@@ -471,6 +472,11 @@ function ReadReport:_precheck()
     self.current_book_title = title
     self.current_book_source = source
 
+    if self.is_downloading() then
+        self.state = "waiting_for_download"
+        self:_log_skip("download_busy")
+        return false
+    end
     if not self.settings:is_cookie_configured() then
         self:_set_error("cookie not configured", "authentication", "read report skipped:")
         return false

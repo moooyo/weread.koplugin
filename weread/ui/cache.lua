@@ -2,6 +2,7 @@
 local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Content = require("weread.lib.content")
+local DownloadPolicy = require("weread.lib.download_policy")
 local logger = require("weread.lib.logger")
 local PathChooser = require("ui/widget/pathchooser")
 local Scan = require("weread.lib.scan")
@@ -16,6 +17,22 @@ local display_error = PluginUtil.display_error
 local file_exists = PluginUtil.file_exists
 
 local M = {}
+
+function M:getChapterDownloadConcurrency()
+    local cache = self.settings:get("cache", {})
+    return DownloadPolicy.concurrency(cache.chapter_download_concurrency)
+end
+
+function M:setChapterDownloadConcurrency(value)
+    local concurrency = DownloadPolicy.concurrency(value)
+    local cache = self.settings:get("cache", {})
+    cache.chapter_download_concurrency = concurrency
+    self.settings:set("cache", cache)
+    self.settings:flush()
+    -- Each job captures its own limit when it starts. Saving a preference must
+    -- not cancel, restart, or resize a download that is already running.
+    return concurrency
+end
 
 function M:setMPImageDownload(enabled)
     local cache = self.settings:get("cache")
@@ -63,13 +80,14 @@ function M:showDownloadDirPicker(touchmenu_instance)
                 self:showInfo(T(_("Cannot use this directory: %1"), err))
                 return
             end
-            local old_dir = self.settings:get_download_dir()
-            self.settings:set_download_dir(path)
-            logger.info("download directory changed:", path)
-            if touchmenu_instance then
-                touchmenu_instance:updateItems()
+            local function apply()
+                local old_dir = self.settings:get_download_dir()
+                self.settings:set_download_dir(path)
+                logger.info("download directory changed:", path)
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+                self:offerMoveBooksToNewDir(old_dir, path)
             end
-            self:offerMoveBooksToNewDir(old_dir, path)
+            if not self._drainCacheDownloads or not self:_drainCacheDownloads(nil, apply) then apply() end
         end,
     }
     UIManager:show(path_chooser)
@@ -114,6 +132,9 @@ function M:offerMoveBooksToNewDir(old_dir, new_dir)
 end
 
 function M:moveBooksToNewDir(movable, new_dir)
+    if self._drainCacheDownloads and self:_drainCacheDownloads(nil, function()
+        self:moveBooksToNewDir(movable, new_dir)
+    end) then return end
     self:showBusy(_("Moving cached books..."))
     UIManager:scheduleIn(0.1, function()
         local books = self.settings:get("books", {})
@@ -126,9 +147,9 @@ function M:moveBooksToNewDir(movable, new_dir)
                 if book then
                     local old_cached_full_book = book.cached_full_book or book.cached_file
                     book.cache_dir = m.dst
-                    book.cached_file = self:remapCachedPath(book.cached_file, m.dst)
+                    book.cached_file = self:remapCachedPath(book.cached_file, m.dst, m.src)
                     book.cached_full_book = self:remapCachedPath(
-                        book.cached_full_book, m.dst)
+                        book.cached_full_book, m.dst, m.src)
                     local new_cached_full_book = book.cached_full_book or book.cached_file
                     if old_cached_full_book and new_cached_full_book ~= old_cached_full_book then
                         table.insert(collection_updates, {
@@ -138,8 +159,15 @@ function M:moveBooksToNewDir(movable, new_dir)
                     end
                     if type(book.cached_chapters) == "table" then
                         for uid, path in pairs(book.cached_chapters) do
-                            book.cached_chapters[uid] = self:remapCachedPath(path, m.dst)
+                            book.cached_chapters[uid] = self:remapCachedPath(path, m.dst, m.src)
                         end
+                    end
+                    if type(book.annotation_documents) == "table" then
+                        local descriptors = {}
+                        for path, descriptor in pairs(book.annotation_documents) do
+                            descriptors[self:remapCachedPath(path, m.dst, m.src)] = descriptor
+                        end
+                        book.annotation_documents = descriptors
                     end
                 end
                 moved = moved + 1
@@ -209,10 +237,15 @@ function M:moveBookDir(src, dst)
 end
 
 -- Rewrite a stored absolute file path to sit under the new book directory,
--- keeping the original filename.
-function M:remapCachedPath(path, dst)
+-- preserving nested edition paths when the original book root is known.
+function M:remapCachedPath(path, dst, src)
     if type(path) ~= "string" then
         return path
+    end
+    if src then
+        local prefix = src:gsub("/+$", "") .. "/"
+        if path:sub(1, #prefix) ~= prefix then return path end
+        return dst:gsub("/+$", "") .. "/" .. path:sub(#prefix + 1)
     end
     local name = path:match("[^/]+$")
     if not name then
@@ -518,8 +551,9 @@ function M:showCacheManagement()
                 text = _("Clear all cache? Downloaded books and articles, underlines, thoughts, and matching progress will be deleted."),
                 ok_text = _("Clear"),
                 ok_callback = function()
-                    self:clearAllCache()
-                    self:refreshCacheManagement(_("Cache cleared"))
+                    self:clearAllCache(function()
+                        self:refreshCacheManagement(_("Cache cleared"))
+                    end)
                 end,
             })
         end),
@@ -667,13 +701,14 @@ function M:confirmClearBookCache(book_id, title, on_cleared)
         text = T(_("Clear cache for \"%1\"?\nDownloaded files, underlines, thoughts, and matching progress will be deleted."), title),
         ok_text = _("Clear"),
         ok_callback = function()
-            self:clearBookCache(book_id)
-            if on_cleared then
-                on_cleared()
-                self:showTransientInfo(_("Cache cleared"))
-            else
-                self:refreshCacheManagement(_("Cache cleared"))
-            end
+            self:clearBookCache(book_id, function()
+                if on_cleared then
+                    on_cleared()
+                    self:showTransientInfo(_("Cache cleared"))
+                else
+                    self:refreshCacheManagement(_("Cache cleared"))
+                end
+            end)
         end,
     })
 end
@@ -734,7 +769,52 @@ function M:clearBookAnnotationData(book_id, book)
     return true
 end
 
-function M:clearBookCache(book_id)
+-- Wait until a background writer exits before deleting its database or files.
+function M:_drainCacheDownloads(book_id, continuation)
+    for _, field in ipairs({ "_annotation_pending_start", "_annotation_pending_prefetch" }) do
+        local pending = self[field]
+        if pending and (not book_id or pending.context
+            and tostring(pending.context.book_id) == tostring(book_id)) then self[field] = nil end
+    end
+    local request = self._external_annotation_sync
+    if request and (not book_id or request.context
+        and tostring(request.context.book_id) == tostring(book_id))
+        and self._cancelUnifiedAnnotationSync then self:_cancelUnifiedAnnotationSync() end
+    local downloader = self.downloader
+    local active = downloader and downloader._active_job
+    if not book_id and downloader and downloader.cancelAll then
+        downloader:cancelAll("cache_cleared")
+    elseif book_id and downloader and downloader.cancelBook then
+        downloader:cancelBook(book_id, "cache_cleared")
+    elseif active and (not book_id or tostring(active.book.book_id or active.book.bookId) == tostring(book_id))
+        and downloader.cancelAll then downloader:cancelAll("cache_cleared") end
+    local worker = self.prefetch_worker
+    if worker and worker.cancel then
+        local pending = {}
+        for _, item in ipairs(worker.pending_queue or {}) do pending[#pending + 1] = item end
+        if worker.pending then pending[#pending + 1] = worker.pending end
+        for _, item in ipairs(pending) do
+            if not book_id or item.options and tostring(item.options.book_id) == tostring(book_id) then
+                worker:cancel(item, "cache_cleared")
+            end
+        end
+    end
+    local job = worker and worker.job
+    local options = job and job.request and job.request.options
+    if job and worker.cancelAll and (not book_id or options
+        and tostring(options.book_id) == tostring(book_id)) then
+        if book_id and worker.cancelAndWait then
+            worker:cancelAndWait(job.request, "cache_cleared", continuation)
+        else worker:cancelAll("cache_cleared", continuation) end
+        return true
+    end
+    return false
+end
+
+function M:clearBookCache(book_id, on_done)
+    if self:_drainCacheDownloads(book_id, function() self:clearBookCache(book_id, on_done) end) then
+        return false
+    end
     local books = self.settings:get("books", {})
     local book = books[book_id]
     local path_to_remove = book and (book.cached_full_book or book.cached_file)
@@ -757,6 +837,8 @@ function M:clearBookCache(book_id)
         end)
     end
     self:refreshShelfCacheIndicators()
+    if on_done then on_done() end
+    return true
 end
 
 function M:clearAllMPCache()
@@ -791,7 +873,8 @@ function M:clearAllMPCache()
     self:refreshShelfCacheIndicators()
 end
 
-function M:clearAllCache()
+function M:clearAllCache(on_done)
+    if self:_drainCacheDownloads(nil, function() self:clearAllCache(on_done) end) then return false end
     local books = self.settings:get("books", {})
     pcall(function()
         local ReadCollection = require("readcollection")
@@ -816,6 +899,8 @@ function M:clearAllCache()
     self.settings:set("books", {})
     self.settings:flush()
     self:refreshShelfCacheIndicators()
+    if on_done then on_done() end
+    return true
 end
 
 return M

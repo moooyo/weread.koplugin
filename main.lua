@@ -84,6 +84,9 @@ function WeReadPlugin:init()
         run_online_task = function(label, fn)
             return self:runOnlineTask(label, fn)
         end,
+        is_reporting = function()
+            return self.read_report and self.read_report.job ~= nil
+        end,
         is_connected = function()
             return self:isNetworkConnected()
         end,
@@ -115,6 +118,9 @@ function WeReadPlugin:init()
         -- because NetworkMgr:isOnline() does a blocking DNS lookup.
         is_online = function()
             return self:isNetworkConnected()
+        end,
+        is_downloading = function()
+            return self.downloader and self.downloader:isManualDownloading()
         end,
     }
     self.progress_sync = ProgressSync:new{
@@ -194,6 +200,9 @@ function WeReadPlugin:init()
         end,
         is_online = function()
             return self:isNetworkConnected()
+        end,
+        is_downloading = function()
+            return self.downloader and self.downloader:isManualDownloading()
         end,
         on_choice = function(context)
             ProgressSyncDialog.show_choice(context)

@@ -10,7 +10,18 @@ if not ok_json then
     ok_json, json = pcall(require, "rapidjson")
 end
 
+-- Keep socket inactivity short while allowing a bounded, steadily progressing
+-- transfer. Large image archives need a larger budget than JSON/chapter text.
 local DEFAULT_TIMEOUT_SECONDS = 15
+local DEFAULT_TOTAL_TIMEOUT_SECONDS = 60
+local DEFAULT_FILE_TOTAL_TIMEOUT_SECONDS = 300
+local ok_time, monotonic_time = pcall(require, "ui/time")
+local function default_now()
+    if ok_time and monotonic_time.now and monotonic_time.to_s then
+        return monotonic_time.to_s(monotonic_time.now())
+    end
+    return os.time()
+end
 local Client = {}
 Client.__index = Client
 
@@ -181,7 +192,124 @@ end
 function Client:new(settings)
     return setmetatable({
         settings = settings,
+        request_sequence = 0,
     }, self)
+end
+
+-- Scope callbacks to this client instance, typically inside one subprocess.
+-- Restore the returned value after the scoped task, including on failure.
+-- cancelled() returns a boolean; on_progress(info) receives start/data/complete
+-- events; on_diagnostic(info) receives structured failures without changing the
+-- string errors expected by existing callers. Per-request options override the
+-- scope. now() is an optional seconds clock for deterministic transport tests.
+function Client:set_request_context(context)
+    local previous = self.request_context
+    self.request_context = context
+    return previous
+end
+
+local function positive_number(value, fallback)
+    value = tonumber(value)
+    if value and value > 0 and value < math.huge then return value end
+    return fallback
+end
+
+function Client:_request_state(opts)
+    opts = opts or {}
+    local context = self.request_context or {}
+    local function option(name)
+        if opts[name] ~= nil then return opts[name] end
+        return context[name]
+    end
+    local file_request = option("timeout_profile") == "file"
+    local default_total = file_request and DEFAULT_FILE_TOTAL_TIMEOUT_SECONDS
+        or DEFAULT_TOTAL_TIMEOUT_SECONDS
+    local block, total = DEFAULT_TIMEOUT_SECONDS, default_total
+    local timeout = option("timeout")
+    if type(timeout) == "table" then
+        block = positive_number(timeout[1], block)
+        total = positive_number(timeout[2], block)
+    elseif type(timeout) == "number" then
+        block = positive_number(timeout, block)
+    end
+    total = positive_number(option("total_timeout"), total)
+    local now = option("now") or default_now
+    local started = now()
+    self.request_sequence = (self.request_sequence or 0) + 1
+    self.last_request_error = nil
+    return {
+        id = self.request_sequence,
+        now = now, started_at = started, deadline = started + total,
+        block_timeout = block, total_timeout = total,
+        cancelled = option("cancelled"), on_progress = option("on_progress"),
+        on_diagnostic = option("on_diagnostic"),
+        bytes = 0, request_bytes = 0, url = opts.url,
+        method = opts.method or (opts.body and "POST" or "GET"),
+    }
+end
+
+function Client:_request_failure(state, kind, message, retryable, code, headers)
+    if state.failure then return state.failure end
+    local retry_after = scalar_header_value(headers, "retry-after")
+    local failure = {
+        event = "error", ok = false, request_id = state.id,
+        kind = kind, message = tostring(message), retryable = retryable == true,
+        url = state.url, method = state.method, status = code,
+        bytes = state.bytes, request_bytes = state.request_bytes,
+        elapsed = math.max(0, state.now() - state.started_at),
+        block_timeout = state.block_timeout, total_timeout = state.total_timeout,
+        retry_after = retry_after,
+        retry_after_seconds = tonumber(retry_after),
+    }
+    state.failure = failure
+    self.last_request_error = failure
+    if type(state.on_diagnostic) == "function" then
+        -- Diagnostics must never interrupt transport cleanup or hide its error.
+        pcall(state.on_diagnostic, failure)
+    end
+    return failure
+end
+
+function Client:_check_request(state)
+    if state.failure then error(state.failure.message, 0) end
+    if type(state.cancelled) == "function" then
+        local ok, cancelled = pcall(state.cancelled)
+        if not ok or cancelled then
+            local message = ok and "request cancelled" or tostring(cancelled)
+            self:_request_failure(state, "cancelled", message, false)
+            error(message, 0)
+        end
+    end
+    if state.now() >= state.deadline then
+        local message = "request total timeout"
+        self:_request_failure(state, "total_timeout", message, true)
+        error(message, 0)
+    end
+end
+
+function Client:_request_progress(state, event)
+    if type(state.on_progress) ~= "function" then return end
+    local ok, err = pcall(state.on_progress, {
+        event = event, request_id = state.id, url = state.url,
+        method = state.method, bytes = state.bytes,
+        request_bytes = state.request_bytes,
+        elapsed = math.max(0, state.now() - state.started_at),
+        block_timeout = state.block_timeout, total_timeout = state.total_timeout,
+    })
+    if not ok then
+        local kind = tostring(err):find("__weread_worker_cancelled__", 1, true)
+            and "cancelled" or "callback_error"
+        self:_request_failure(state, kind, err, false)
+        error(err, 0)
+    end
+end
+
+local function transport_failure_kind(message)
+    local text = tostring(message):lower()
+    if text:find("timeout", 1, true) or text == "wantread" or text == "wantwrite" then
+        return "transport_timeout"
+    end
+    return "transport_error"
 end
 
 function Client:json_encode(data)
@@ -223,8 +351,15 @@ function Client:decode_http_json(text, context)
     return data
 end
 
-function Client:request(opts)
+function Client:request(opts, state)
     opts = opts or {}
+    state = state or self:_request_state(opts)
+    state.url = opts.url
+    state.method = opts.method or (opts.body and "POST" or "GET")
+    state.request_bytes = 0
+    self:_check_request(state)
+    self:_request_progress(state, "start")
+    self:_check_request(state)
     local body = opts.body
     local response
     local headers = {
@@ -244,37 +379,98 @@ function Client:request(opts)
     if body then
         headers["Content-Length"] = tostring(#body)
     end
-    local block_timeout = DEFAULT_TIMEOUT_SECONDS
-    local total_timeout = -1
-    if type(opts.timeout) == "table" and opts.timeout[1] then
-        block_timeout = opts.timeout[1]
-        total_timeout = opts.timeout[2] or block_timeout
-    elseif type(opts.timeout) == "number" then
-        block_timeout = opts.timeout
-    end
-    socketutil:set_timeout(block_timeout, total_timeout)
-
     local sink_to_use = opts.sink
     if not sink_to_use then
         response = {}
-        sink_to_use = socketutil.table_sink(response)
+        -- Own the deadline instead of using socketutil's process-global sink
+        -- timeout, which may be reset by a different request.
+        sink_to_use = function(chunk)
+            if chunk then response[#response + 1] = chunk end
+            return 1
+        end
+    end
+    local max_bytes = tonumber(opts.max_bytes)
+    local sink_ended = false
+    local function end_sink(err)
+        if sink_ended then return end
+        sink_ended = true
+        -- Preserve LTN12's terminal notification for caller-owned file sinks,
+        -- including when our guard aborts before the source reaches EOF.
+        pcall(sink_to_use, nil, err)
+    end
+    local function checked_sink(chunk, source_error)
+        self:_check_request(state)
+        if source_error then
+            self:_request_failure(state, transport_failure_kind(source_error),
+                source_error, true)
+            end_sink(source_error)
+            return nil, source_error
+        end
+        if chunk and max_bytes and state.request_bytes + #chunk > max_bytes then
+            local message = "download exceeds size limit"
+            self:_request_failure(state, "size_limit", message, false)
+            end_sink(message)
+            return nil, message
+        end
+        if chunk == nil then sink_ended = true end
+        local accepted, err = sink_to_use(chunk, source_error)
+        if not accepted then
+            self:_request_failure(state, "sink_error", err or "response sink failed", false)
+            end_sink(err or "response sink failed")
+            return nil, err or "response sink failed"
+        end
+        if chunk and #chunk > 0 then
+            state.bytes = state.bytes + #chunk
+            state.request_bytes = state.request_bytes + #chunk
+            self:_request_progress(state, "data")
+        end
+        self:_check_request(state)
+        return accepted
+    end
+    local function guarded_sink(chunk, source_error)
+        local ok, accepted, err = pcall(checked_sink, chunk, source_error)
+        if not ok then
+            self:_request_failure(state, "sink_error", accepted, false)
+            end_sink(accepted)
+            -- Return through ltn12.pump rather than throwing out of the sink:
+            -- LuaSocket's h.try finalizer then closes the underlying socket.
+            return nil, tostring(accepted)
+        end
+        return accepted, err
     end
 
     local req_opts = merge_req_opts({
         method = body and "POST" or "GET",
         source = body and ltn12.source.string(body) or nil,
-        sink = sink_to_use,
         headers = headers,
     }, opts)
+    req_opts.sink = guarded_sink
     -- Redirects are handled explicitly by request_follow so credentials can be
     -- rebuilt for every destination instead of being copied across origins.
     req_opts.redirect = false
     local diagnostic_api = req_opts.diagnostic_api
     req_opts.diagnostic_api = nil
+    for _, name in ipairs({ "cancelled", "on_progress", "on_diagnostic", "now",
+        "timeout", "total_timeout", "timeout_profile", "max_bytes" }) do
+        req_opts[name] = nil
+    end
 
+    self:_check_request(state)
+    local remaining = state.deadline - state.now()
+    -- Socket timeouts bound individual blocking operations. The checks above,
+    -- in every sink, and after request() enforce the logical request budget.
+    -- Blocking DNS cannot be interrupted here; the subprocess watchdog owns it.
+    socketutil:set_timeout(math.min(state.block_timeout, remaining), remaining)
     local results = { pcall(http.request, req_opts) }
     socketutil:reset_timeout()
+    local checked, check_error = pcall(self._check_request, self, state)
+    if not checked then
+        end_sink(check_error)
+        error(check_error, 0)
+    end
     if not results[1] then
+        end_sink(results[2])
+        self:_request_failure(state, transport_failure_kind(results[2]), results[2], true)
         logger.err(
             "HTTP transport failed:",
             "method=", tostring(req_opts.method),
@@ -282,11 +478,29 @@ function Client:request(opts)
             "api=", tostring(diagnostic_api or "unknown"),
             "error=", tostring(results[2])
         )
-        error(results[2])
+        error(results[2], 0)
     end
-    local _, raw_code, resp_headers, status = results[2], results[3], results[4], results[5]
+    local success, raw_code, resp_headers, status = results[2], results[3], results[4], results[5]
     if status == nil and type(raw_code) == "string" then
         status = raw_code
+    end
+    if not success then
+        local message = status or raw_code or "HTTP transport returned no result"
+        end_sink(message)
+        self:_request_failure(state, transport_failure_kind(message), message, true)
+        error(message, 0)
+    end
+
+    local code = tonumber(raw_code)
+    local length = tonumber(scalar_header_value(resp_headers, "content-length"))
+    if code and code >= 200 and code < 300 and code ~= 204
+        and req_opts.method ~= "HEAD" and length and length >= 0
+        and not header_value(resp_headers, "transfer-encoding")
+        and state.request_bytes ~= length then
+        local message = "response length mismatch: expected " .. tostring(length)
+            .. ", received " .. tostring(state.request_bytes)
+        self:_request_failure(state, "short_read", message, true, code, resp_headers)
+        error(message, 0)
     end
 
     if not opts.sink then response = table.concat(response) end
@@ -297,8 +511,9 @@ function Client:request(opts)
         end
     end
 
-    local code = tonumber(raw_code)
     if code and code >= 400 then
+        self:_request_failure(state, "http_error", http_error(self, code, response, resp_headers),
+            code == 408 or code == 425 or code == 429 or code >= 500, code, resp_headers)
         log_response("HTTP response failed:", {
             method = req_opts.method,
             url = req_opts.url,
@@ -307,6 +522,7 @@ function Client:request(opts)
             headers = resp_headers,
         }, type(response) == "string" and response or "")
     elseif not code then
+        self:_request_failure(state, "transport_error", status or "HTTP response unavailable", true)
         log_response("HTTP response unavailable:", {
             method = req_opts.method,
             url = req_opts.url,
@@ -316,11 +532,17 @@ function Client:request(opts)
         }, type(response) == "string" and response or "")
     end
 
+    if not state.failure then
+        self:_request_progress(state, "complete")
+        self:_check_request(state)
+    end
+
     return response, code, resp_headers or {}, status
 end
 
-function Client:request_follow(opts, max_redirects)
+function Client:request_follow(opts, max_redirects, state)
     local request_opts = deepcopy(opts or {})
+    state = state or self:_request_state(request_opts)
     local on_redirect = request_opts.on_redirect
     request_opts.on_redirect = nil
     max_redirects = max_redirects or request_opts.maxredirects or 5
@@ -329,7 +551,7 @@ function Client:request_follow(opts, max_redirects)
 
     for _redirect_index = 0, max_redirects do
         request_opts.url = url
-        local text, code, headers, status = self:request(request_opts)
+        local text, code, headers, status = self:request(request_opts, state)
         local is_redirect = code == 301 or code == 302 or code == 303
             or code == 307 or code == 308
         if not is_redirect then
@@ -361,7 +583,8 @@ function Client:request_follow(opts, max_redirects)
         end
         url = next_url
     end
-    error("Too many redirects")
+    self:_request_failure(state, "redirect_limit", "Too many redirects", false)
+    error("Too many redirects", 0)
 end
 
 -- Download a response directly to disk. The sink deliberately stays open when
@@ -370,23 +593,29 @@ end
 function Client:download_to_file(url, path, opts)
     opts = opts or {}
     local part_path = path .. ".part"
-    pcall(os.remove, part_path)
-    local handle, open_err = io.open(part_path, "wb")
-    if not handle then error(open_err or "could not create download file") end
-
+    local handle
     local bytes = 0
-    local max_bytes = tonumber(opts.max_bytes)
+    local state
+    local function fail(kind, message, retryable)
+        self:_request_failure(state, kind, message, retryable)
+        error(message, 0)
+    end
+    local function close()
+        if not handle then return end
+        local current = handle
+        handle = nil
+        local ok, err = current:close()
+        if not ok then fail("io_error", err or "could not close download file", false) end
+    end
     local function reopen()
-        if handle then handle:close() end
+        close()
+        local open_err
         handle, open_err = io.open(part_path, "wb")
-        if not handle then error(open_err or "could not reset download file") end
+        if not handle then fail("io_error", open_err or "could not create download file", false) end
         bytes = 0
     end
     local function sink(chunk)
         if not chunk then return 1 end
-        if max_bytes and bytes + #chunk > max_bytes then
-            return nil, "download exceeds size limit"
-        end
         local ok, err = handle:write(chunk)
         if not ok then return nil, err end
         bytes = bytes + #chunk
@@ -397,43 +626,74 @@ function Client:download_to_file(url, path, opts)
         url = url,
         method = "GET",
         maxredirects = 5,
+        timeout_profile = "file",
         sink = sink,
-        on_redirect = function()
+        on_redirect = function(from, to, code)
             reopen()
+            if opts.on_redirect then opts.on_redirect(from, to, code) end
         end,
         headers = {
             ["Accept"] = header_value(opts.headers, "Accept") or opts.accept or "*/*",
             ["Referer"] = header_value(opts.headers, "Referer") or opts.referer or "https://weread.qq.com/",
         },
     })
-    request_opts.max_bytes = nil
     request_opts.accept = nil
     request_opts.referer = nil
+    state = self:_request_state(request_opts)
 
-    local ok, text, code, resp_headers = pcall(function()
-        return self:request_follow(request_opts)
+    local ok, result, saved_bytes, headers = pcall(function()
+        self:_check_request(state)
+        reopen()
+        local text, code, resp_headers = self:request_follow(request_opts, nil, state)
+        if not code or code < 200 or code >= 300 then
+            fail("http_error", http_error(self, code, text, resp_headers), false)
+        end
+        if bytes == 0 then fail("empty_body", "download returned an empty body", true) end
+        close()
+        self:_check_request(state)
+        -- POSIX rename replaces the destination atomically. Never delete an
+        -- existing successful download before knowing its replacement is ready.
+        local renamed, rename_err = os.rename(part_path, path)
+        if not renamed then
+            -- Some hosts cannot replace an existing file with rename. Preserve
+            -- it in a unique backup and restore it if the second rename fails.
+            local existing = io.open(path, "rb")
+            if existing then
+                existing:close()
+                local backup = path .. ".previous-" .. tostring(state.id)
+                local suffix = 0
+                while true do
+                    self:_check_request(state)
+                    local occupied = io.open(backup, "rb")
+                    if not occupied then break end
+                    occupied:close()
+                    suffix = suffix + 1
+                    backup = path .. ".previous-" .. tostring(state.id) .. "-" .. tostring(suffix)
+                end
+                local moved = os.rename(path, backup)
+                if moved then
+                    renamed, rename_err = os.rename(part_path, path)
+                    if renamed then
+                        os.remove(backup)
+                    else
+                        local restored, restore_err = os.rename(backup, path)
+                        if not restored then
+                            rename_err = tostring(rename_err) .. "; previous file preserved at "
+                                .. backup .. ": " .. tostring(restore_err)
+                        end
+                    end
+                end
+            end
+        end
+        if not renamed then fail("io_error", rename_err or "could not commit downloaded file", false) end
+        return path, bytes, resp_headers
     end)
-    if handle then handle:close() end
-    handle = nil
+    if handle then pcall(close) end
     if not ok then
         pcall(os.remove, part_path)
-        error(text, 0)
+        error(result, 0)
     end
-    if not code or code < 200 or code >= 300 then
-        pcall(os.remove, part_path)
-        error(http_error(self, code, text, resp_headers))
-    end
-    if bytes == 0 then
-        pcall(os.remove, part_path)
-        error("download returned an empty body")
-    end
-    pcall(os.remove, path)
-    local renamed, rename_err = os.rename(part_path, path)
-    if not renamed then
-        pcall(os.remove, part_path)
-        error(rename_err or "could not commit downloaded file")
-    end
-    return path, bytes, resp_headers
+    return result, saved_bytes, headers
 end
 
 function Client:post_json(url, data, opts)
@@ -506,6 +766,7 @@ function Client:get_binary(url, opts)
     opts = opts or {}
     local req_opts = merge_req_opts(opts, {
         maxredirects = 5,
+        timeout_profile = "file",
         headers = {
             ["Accept"] = header_value(opts.headers, "Accept") or opts.accept or "*/*",
             ["Referer"] = header_value(opts.headers, "Referer") or opts.referer or "https://weread.qq.com/",

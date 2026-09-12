@@ -17,6 +17,7 @@ function Store:open(book_id, create)
     local db, err = self.legacy:open("weread-book-" .. tostring(book_id), create)
     if not db then return nil, err end
     local ok, schema_err = pcall(function()
+        db:exec("PRAGMA busy_timeout=1000")
         db:exec([[
             CREATE TABLE IF NOT EXISTS annotation_data (
                 kind TEXT NOT NULL,
@@ -53,13 +54,23 @@ end
 
 -- All mutations in a chapter commit share a transaction. A nil value deletes
 -- an entry; nil key deletes this kind only for the supplied chapter UID.
-function Store:write(book_id, changes)
+function Store:_transaction(book_id, callback)
     local db, open_err = self:open(book_id, true)
     if not db then error(open_err) end
     local stmt
+    local result
     local ok, err = pcall(function()
         db:exec("BEGIN IMMEDIATE")
-        for _, change in ipairs(changes) do
+        local function read(kind, key)
+            stmt = db:prepare("SELECT payload FROM annotation_data WHERE kind=? AND entry_key=?")
+            local row = stmt:reset():bind(kind, tostring(key)):step()
+            local value
+            if row then value = json.decode(row[1]) end
+            stmt:close(); stmt = nil
+            return value
+        end
+        local function write(changes)
+          for _, change in ipairs(changes) do
             if change.value ~= nil then
                 stmt = db:prepare([[
                     INSERT INTO annotation_data(kind,entry_key,chapter_uid,payload)
@@ -68,6 +79,11 @@ function Store:write(book_id, changes)
                 ]])
                 stmt:reset():bind(change.kind, tostring(change.key),
                     tostring(change.uid or ""), json.encode(change.value)):step()
+            elseif change.prefix ~= nil then
+                stmt = db:prepare([[DELETE FROM annotation_data WHERE kind=?
+                    AND chapter_uid=? AND substr(entry_key,1,?)=?]])
+                stmt:reset():bind(change.kind, tostring(change.uid),
+                    #change.prefix, change.prefix):step()
             elseif change.key ~= nil then
                 stmt = db:prepare("DELETE FROM annotation_data WHERE kind=? AND entry_key=?")
                 stmt:reset():bind(change.kind, tostring(change.key)):step()
@@ -77,17 +93,85 @@ function Store:write(book_id, changes)
             end
             stmt:close()
             stmt = nil
+          end
         end
+        result = callback(read, write)
         db:exec("COMMIT")
     end)
     if stmt then pcall(function() stmt:close() end) end
     if not ok then pcall(function() db:exec("ROLLBACK") end) end
     db:close()
     if not ok then error(err) end
+    return result
 end
 
-function Store:put(book_id, kind, key, value, uid)
-    self:write(book_id, { { kind = kind, key = key, value = value, uid = uid } })
+-- Check ownership inside the same write transaction. A late response from a
+-- superseded refresh must never recreate staging rows or publish older data.
+function Store:write(book_id, changes, condition)
+    return self:_transaction(book_id, function(read, write)
+        if condition then
+            local actual = read(condition.kind, condition.key)
+            if condition.field then actual = actual and actual[condition.field] end
+            if actual ~= condition.value then return false end
+        end
+        write(changes)
+        return true
+    end)
+end
+
+function Store:beginDownload(book_id, uid, refresh)
+    return self:_transaction(book_id, function(read, write)
+        local stage = not refresh and read("download", uid)
+        if stage and stage.version == 2 then return stage end
+        local generation = (tonumber(read("generation", uid)) or 0) + 1
+        local value = { version = 2, epoch = generation,
+            revision = tostring(stage and stage.revision or generation), next_batch = 1 }
+        -- Preserve old staging until its immutable plan has been converted.
+        if stage then value.legacy = stage end
+        local changes = {
+            { kind = "generation", key = uid, uid = uid, value = generation },
+            { kind = "download", key = uid, uid = uid, value = value },
+        }
+        if refresh then
+            changes[#changes + 1] = { kind = "refresh", key = uid, uid = uid, value = true }
+            for _, kind in ipairs({ "underlines", "batch", "matching", "match_batch" }) do
+                changes[#changes + 1] = { kind = kind, uid = uid }
+            end
+        end
+        write(changes)
+        return value
+    end)
+end
+
+function Store:epochCondition(uid, epoch)
+    return { kind = "generation", key = uid, value = epoch }
+end
+
+-- Revocation is also used before clearing rows while a worker is stopping.
+function Store:invalidateChapters(book_id, chapters)
+    for _, chapter in ipairs(chapters or {}) do
+        local uid = tostring(chapter.chapterUid or chapter.chapterId or chapter.chapter_uid)
+        self:beginDownload(book_id, uid, true)
+    end
+end
+
+function Store:put(book_id, kind, key, value, uid, condition)
+    return self:write(book_id, { { kind = kind, key = key, value = value, uid = uid } }, condition)
+end
+
+function Store:listKeys(book_id, kind, uid)
+    local db, err = self:open(book_id, false)
+    if not db then if err then error(err) end; return {} end
+    local stmt, keys = nil, {}
+    local ok, read_err = pcall(function()
+        stmt = db:prepare("SELECT entry_key FROM annotation_data WHERE kind=? AND chapter_uid=?")
+        local row = stmt:reset():bind(kind, tostring(uid)):step()
+        while row do keys[row[1]] = true; row = stmt:step() end
+    end)
+    if stmt then stmt:close() end
+    db:close()
+    if not ok then error(read_err) end
+    return keys
 end
 
 function Store:clearBook(book_id)

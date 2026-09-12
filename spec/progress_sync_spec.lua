@@ -77,13 +77,16 @@ local function fixture(remote, options)
     }
     local choices = {}
     local uploads = {}
+    local pulls = {}
     local jumps = {}
     local notifications = {}
     local client = {
         get_progress = function()
+            pulls[#pulls + 1] = "gateway"
             return { book = remote }
         end,
         get_web_progress = function()
+            pulls[#pulls + 1] = "web"
             return remote
         end,
     }
@@ -121,6 +124,7 @@ local function fixture(remote, options)
             notifications[#notifications + 1] = { code = code, data = data }
         end,
         is_online = options.is_online,
+        is_downloading = options.is_downloading,
         now = options.now,
     }
     local function step()
@@ -143,6 +147,7 @@ local function fixture(remote, options)
         values = values,
         choices = choices,
         uploads = uploads,
+        pulls = pulls,
         jumps = jumps,
         notifications = notifications,
         queue = queue,
@@ -578,6 +583,310 @@ test("a fresh automatic pull replaces an older retry chain", function()
     eq(#f.queue, 1, "stale chain does not schedule another retry")
     f.step()
     eq(#f.queue, 1, "replacement chain remains active")
+end)
+
+local function aligned_fixture(options)
+    return fixture({
+        bookId = "book", progress = 25, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 150, updateTime = 10,
+    }, options)
+end
+
+test("download waits preserve the complete automatic pull retry budget", function()
+    local downloading, online_checks = true, 0
+    local f = aligned_fixture({
+        is_downloading = function() return downloading end,
+        is_online = function()
+            online_checks = online_checks + 1
+            return false
+        end,
+    })
+    f.sync:on_reader_ready()
+    for _ = 1, 6 do eq(f.step(), true, "download wait remains scheduled") end
+    eq(online_checks, 0, "download waits do not attempt an online check")
+    eq(#f.pulls, 0, "download waits do not fetch remote progress")
+    eq(f.sync:status().pulling, false, "download wait does not hold the pull lock")
+    eq(#f.notifications, 0, "automatic download waits remain silent")
+    downloading = false
+    f.drain()
+    eq(online_checks, 4, "initial pull and all three retries remain available")
+    eq(#f.queue, 0, "offline attempts stop after the normal retry budget")
+end)
+
+test("resume pull waits for download completion", function()
+    local downloading, now = false, 0
+    local f = aligned_fixture({
+        is_downloading = function() return downloading end,
+        now = function() return now end,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    local initial_pulls = #f.pulls
+    f.sync:on_suspend()
+    now, downloading = 5 * 60, true
+    f.sync:on_resume()
+    for _ = 1, 5 do eq(f.step(), true, "resume remains deferred while downloading") end
+    eq(#f.pulls, initial_pulls, "resume does not pull during the download")
+    eq(f.sync:status().pulling, false, "deferred resume releases the pull lock")
+    downloading = false
+    f.drain()
+    eq(#f.pulls, initial_pulls + 2, "resume fetches each remote source once")
+    eq(f.sync:status().verified, true, "resume verifies after the download")
+end)
+
+test("automatic pull checks downloading again inside the online callback", function()
+    local downloading, callbacks = false, {}
+    local f = aligned_fixture({
+        is_downloading = function() return downloading end,
+        run_online = function(_kind, callback)
+            callbacks[#callbacks + 1] = callback
+            return true
+        end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#callbacks, 1, "automatic pull reaches the online scheduler")
+    downloading = true
+    callbacks[1]()
+    eq(#f.pulls, 0, "late download start blocks both remote sources")
+    eq(f.sync:status().pulling, false, "late download start releases the pull lock")
+    eq(#f.queue, 1, "late download start queues one deferred pull")
+    downloading = false
+    f.sync.run_online = function(_kind, callback) callback(); return true end
+    f.drain()
+    eq(#f.pulls, 2, "deferred callback resumes one pull")
+    eq(f.sync:status().verified, true, "resumed callback verifies the session")
+end)
+
+test("close preserves its snapshot and upload budget throughout a download", function()
+    local downloading = false
+    local f = aligned_fixture({ is_downloading = function() return downloading end })
+    f.sync:on_reader_ready()
+    f.drain()
+    downloading = true
+    f.document.page = 50
+    f.sync:on_page_update()
+    local generation = f.sync.generation
+    f.sync:on_close_document()
+    eq(f.sync.generation, generation + 1, "close immediately invalidates old pull work")
+    eq(#f.uploads, 0, "close does not upload during the download")
+    eq(f.sync:status().uploading, false, "download wait does not hold the upload lock")
+    eq(f.values.books.book.pending_upload_position.percent, 50, "close persists its snapshot")
+    for _ = 1, 12 do eq(f.step(), true, "upload wait outlives the network retry budget") end
+    eq(#f.uploads, 0, "long download wait still makes no upload")
+    eq(f.sync:status().uploading, false, "long download wait leaves newer snapshots possible")
+    local attempts, uploaded = 0
+    f.sync.upload_position = function(_book_id, position)
+        attempts = attempts + 1
+        if attempts < 10 then return false, { error = "busy", error_kind = "busy" } end
+        uploaded = position
+        return true, { accepted = true }
+    end
+    downloading = false
+    f.drain()
+    eq(attempts, 10, "download waits do not consume any upload attempt")
+    eq(uploaded and uploaded.percent, 50, "closed document uploads its immutable snapshot")
+    eq(f.values.books.book.pending_upload_position, nil, "successful deferred upload clears pending")
+    eq(f.sync:status().state == "uploading", false, "closed-session completion clears the uploading state")
+end)
+
+test("automatic upload checks downloading again inside the online callback", function()
+    local downloading, callbacks = false, {}
+    local f = aligned_fixture({ is_downloading = function() return downloading end })
+    f.sync:on_reader_ready()
+    f.drain()
+    local generation = f.sync.generation
+    f.sync.run_online = function(_kind, callback)
+        callbacks[#callbacks + 1] = callback
+        return true
+    end
+    f.document.page = 50
+    f.sync:on_close_document()
+    eq(f.sync.generation, generation + 1, "close invalidates old pulls before returning")
+    eq(#callbacks, 1, "close schedules one online callback")
+    downloading = true
+    callbacks[1]()
+    eq(#f.uploads, 0, "late download start prevents the upload")
+    eq(f.sync:status().uploading, false, "deferred callback releases the upload lock")
+    eq(f.sync:status().state == "uploading", false, "late download start clears the uploading state")
+    eq(f.values.books.book.pending_upload_position.percent, 50, "deferred callback keeps its snapshot")
+    downloading = false
+    f.sync.run_online = function(_kind, callback) callback(); return true end
+    f.drain()
+    eq(#f.uploads, 1, "deferred upload resumes exactly once")
+    eq(f.uploads[1] and f.uploads[1].percent, 50, "deferred callback uses the captured position")
+end)
+
+test("a newer same-book snapshot replaces an older deferred upload", function()
+    local downloading = false
+    local f = aligned_fixture({
+        is_downloading = function() return downloading end,
+        now = function() return 100 end,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    downloading = true
+    f.document.page = 40
+    f.sync:on_suspend()
+    eq(f.values.books.book.pending_upload_position.percent, 40, "suspend captures the first snapshot")
+    eq(f.sync:status().uploading, false, "first deferred snapshot leaves upload available")
+    f.document.page = 60
+    f.sync:on_page_update()
+    f.sync:on_close_document()
+    eq(f.values.books.book.pending_upload_position.percent, 60, "close replaces the older snapshot")
+    downloading = false
+    f.drain()
+    eq(#f.uploads, 1, "superseded deferred snapshot never uploads")
+    eq(f.uploads[1] and f.uploads[1].percent, 60, "latest snapshot wins even at the same timestamp")
+    eq(f.values.books.book.pending_upload_position, nil, "latest accepted snapshot clears pending")
+end)
+
+test("a closed-session upload cannot clear movement in a reopened document", function()
+    local callback
+    local f = aligned_fixture()
+    f.sync:on_reader_ready()
+    f.drain()
+    f.sync.run_online = function(kind, action)
+        if kind == "progress_upload" then callback = action else action() end
+        return true
+    end
+    f.document.page = 40
+    f.sync:on_close_document()
+    f.document.page = 25
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 60
+    f.sync:on_page_update()
+    eq(f.sync:status().dirty, true, "reopened document has fresh movement")
+    callback()
+    eq(#f.uploads, 1, "closing snapshot can still finish after reopening")
+    eq(f.uploads[1] and f.uploads[1].percent, 40, "old completion uploads only its own snapshot")
+    eq(f.sync:status().dirty, true, "old completion does not clear new movement")
+    eq(f.sync:status().local_position.percent, 60, "old completion does not replace the live position")
+end)
+
+local function set_fake_credentials(values)
+    values.account = { user_vid = "offline-user-a", login_time = 100 }
+    values.cookies = { wr_vid = "offline-user-a", wr_skey = "offline-cookie-a" }
+    values.api_key = "offline-api-a"
+end
+
+for _, field in ipairs({ "account", "login_time", "cookies", "api_key" }) do
+    test("changed " .. field .. " revokes a deferred automatic upload", function()
+        local downloading = false
+        local f = aligned_fixture({ is_downloading = function() return downloading end })
+        set_fake_credentials(f.values)
+        f.sync:on_reader_ready()
+        f.drain()
+        downloading = true
+        f.document.page = 40
+        f.sync:on_suspend()
+        if field == "account" then
+            f.values.account.user_vid = "offline-user-b"
+        elseif field == "login_time" then
+            f.values.account.login_time = 101
+        elseif field == "cookies" then
+            f.values.cookies.wr_vid = "offline-user-b"
+        else
+            f.values.api_key = "offline-api-b"
+        end
+        downloading = false
+        f.drain()
+        eq(#f.uploads, 0, "credentials changed before deferred upload reached the network")
+        eq(f.sync:status().uploading, false, "revoked upload releases its state")
+        eq(f.values.books.book.pending_upload_position, nil, "revoked identity clears its old pending snapshot")
+    end)
+end
+
+test("credential changes also revoke an already scheduled online upload", function()
+    local callback
+    local f = aligned_fixture()
+    set_fake_credentials(f.values)
+    f.sync:on_reader_ready()
+    f.drain()
+    f.sync.run_online = function(_kind, action) callback = action; return true end
+    f.document.page = 40
+    f.sync:on_close_document()
+    f.values.api_key = "offline-api-b"
+    callback()
+    eq(#f.uploads, 0, "online callback rejects the old account identity")
+    eq(f.sync:status().uploading, false, "revoked callback releases uploading")
+    eq(f.sync:status().state == "uploading", false, "revoked callback clears the uploading state")
+    eq(f.values.books.book.pending_upload_position, nil, "revoked callback clears the old pending snapshot")
+end)
+
+test("equivalent credential tables preserve a deferred automatic upload", function()
+    local downloading = false
+    local f = aligned_fixture({ is_downloading = function() return downloading end })
+    set_fake_credentials(f.values)
+    f.sync:on_reader_ready()
+    f.drain()
+    downloading = true
+    f.document.page = 40
+    f.sync:on_suspend()
+    set_fake_credentials(f.values)
+    downloading = false
+    f.drain()
+    eq(#f.uploads, 1, "equivalent account values do not revoke an upload")
+    eq(f.uploads[1] and f.uploads[1].percent, 40, "unchanged identity retains the original snapshot")
+end)
+
+test("same-account session credential rotation preserves a deferred upload", function()
+    local downloading = false
+    local f = aligned_fixture({ is_downloading = function() return downloading end })
+    set_fake_credentials(f.values)
+    f.values.wr_ticket, f.values.wr_wrpa = "offline-ticket-a", "offline-wrpa-a"
+    f.sync:on_reader_ready()
+    f.drain()
+    downloading = true
+    f.document.page = 40
+    f.sync:on_suspend()
+    f.values.cookies.wr_skey = "offline-cookie-rotated"
+    f.values.wr_ticket, f.values.wr_wrpa = "offline-ticket-rotated", "offline-wrpa-rotated"
+    downloading = false
+    f.drain()
+    eq(#f.uploads, 1, "session rotation does not revoke a stable account identity")
+    eq(f.uploads[1] and f.uploads[1].percent, 40, "rotated session uploads the original snapshot")
+    eq(f.values.books.book.pending_upload_position, nil, "rotated session success clears pending")
+end)
+
+test("explicit local choice supersedes an older deferred automatic snapshot", function()
+    local downloading = false
+    local f = aligned_fixture({
+        is_downloading = function() return downloading end,
+        now = function() return 100 end,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    downloading = true
+    f.document.page = 40
+    f.sync:on_suspend()
+    f.document.page = 60
+    f.sync:on_page_update()
+    f.sync:sync_now()
+    eq(#f.choices, 1, "manual conflict can supersede a deferred automatic snapshot")
+    f.choices[1].keep_local()
+    eq(#f.uploads, 1, "explicit local choice uploads while the download continues")
+    eq(f.uploads[1] and f.uploads[1].percent, 60, "explicit choice uploads the newer snapshot")
+    downloading = false
+    f.drain()
+    eq(#f.uploads, 1, "old automatic callback cannot overwrite the explicit choice")
+    eq(f.values.books.book.last_uploaded_position.percent, 60, "explicit choice remains the last upload")
+    eq(f.values.books.book.pending_upload_position, nil, "superseded automatic snapshot stays cleared")
+end)
+
+test("manual sync and explicit local choice remain available during downloads", function()
+    local f = fixture({
+        bookId = "book", progress = 50, chapterUid = 33,
+        chapterIdx = 3, chapterOffset = 100, updateTime = 10,
+    }, { is_downloading = function() return true end })
+    eq(f.sync:sync_now(), true, "manual sync bypasses the download gate")
+    eq(#f.pulls, 2, "manual sync fetches both remote sources")
+    eq(#f.choices, 1, "manual sync can present its conflict")
+    f.choices[1].keep_local()
+    eq(#f.uploads, 1, "explicit local choice bypasses the download gate")
+    eq(f.uploads[1] and f.uploads[1].percent, 25, "explicit choice uploads the selected local position")
+    eq(#f.queue, 0, "explicit operations do not leave automatic download waits")
 end)
 
 print(string.format(

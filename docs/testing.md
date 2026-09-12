@@ -1,5 +1,45 @@
 # Testing / 测试
 
+## Credential export and controlled concurrency probes
+
+Run the offline helper tests with:
+
+```powershell
+ssh test-env "cd /path/to/snapshot && python3 -m unittest discover -s spec -p '*_spec.py'"
+```
+
+`scripts/export_weread_test_credentials.py` accepts a copied browser Cookie
+header through `--cookie-header-file`, or a copied KOReader settings file through
+`--settings`. It writes only cookies in Netscape format, never evaluates Lua,
+does not print credential values, and refuses to overwrite an existing output.
+Keep input/output outside the source checkout. POSIX output is created with
+mode 0600; Windows access follows the containing directory's ACL.
+
+`scripts/verify_parallel_chapters.py` uses a read-only cookie file and reports
+decoded chapter digests and timing. Its offline tests use fake transport.
+Real execution is an explicit, separate gate: it must use an authorized test
+account, run on `test-env`, and never be added to ordinary CI. The probe neither
+renews cookies nor reports reading progress. Start with its default sequential
+controls before explicitly selecting a parallel case.
+
+For matched-work timing, add `--timing-controls` together with `--modes parallel`.
+This brackets the parallel pair with two serial pairs using identical reader
+refreshes, detected formats, and shard requests. Automatic-format baselines
+may perform additional requests and must not be used as a direct speed control.
+See the [first real-service validation](real-chapter-concurrency-validation.md)
+for the measured sample and its coverage limits.
+
+Explicit higher-concurrency trials use `--chapter-count 5 --concurrency 5`
+or the corresponding values of 10. Add `--start-interval 0` only for a short
+trial intended to measure actual overlap; the same setting applies to the
+serial controls. Always distinguish configured concurrency from
+`stage_stats.parallel.peak_in_flight`. A missing chapter, error, or digest
+mismatch stops the trial; do not silently shrink the sample or retry into a
+successful result. See the [five/ten-chapter report](five-ten-chapter-validation.md).
+
+The current plugin download engine remains serial. Passing synthetic tests
+does not establish a safe real-service concurrency limit.
+
 The project uses three test layers. None of them contacts a real WeRead
 account, and fixtures must not contain API keys, cookies, account identifiers,
 private notes, or book content.

@@ -68,8 +68,10 @@ local function test(name, fn)
     fn()
 end
 
-local function fixture(provider)
+local function fixture(provider, options)
+    options = options or {}
     local records = {}
+    local scheduled = {}
     local settings = {
         get = function(_self, key)
             if key == "read_report" then
@@ -96,17 +98,20 @@ local function fixture(provider)
         settings = settings,
         client = client,
         scheduler = {
-            scheduleIn = function() end,
+            scheduleIn = function(_self, delay, callback)
+                scheduled[#scheduled + 1] = { delay = delay, callback = callback }
+            end,
             unschedule = function() end,
         },
         get_document = function() return { file = "/book.epub" } end,
         detect_book = function() return "book" end,
         position_provider = provider,
-        is_online = function() return true end,
+        is_online = options.is_online or function() return true end,
+        is_downloading = options.is_downloading,
         subprocess = false,
         now = function() return 100 end,
     }
-    return report, records
+    return report, records, scheduled
 end
 
 test("unverified position blocks reading-time reporting", function()
@@ -127,6 +132,61 @@ test("verified live position passes the reporting gate", function()
     eq(proceed, true, "precheck passed")
     eq(book_id, "book", "target book")
     eq(position, live, "live position forwarded")
+end)
+
+test("manual download defers scheduled reports without consuming failures", function()
+    local downloading, online_checks, position_checks, spawned = true, 0, 0, 0
+    local report, _, scheduled = fixture(function()
+        position_checks = position_checks + 1
+        return { chapter_uid = 22 }, nil, true
+    end, {
+        is_downloading = function() return downloading end,
+        is_online = function() online_checks = online_checks + 1; return true end,
+    })
+    report._start_job = function() spawned = spawned + 1; return true end
+    report:start("fixture")
+    for index = 1, 12 do
+        scheduled[index].callback()
+        eq(scheduled[index + 1].delay, 30, "waiting keeps the report cadence")
+    end
+    eq(spawned, 0, "waiting never starts a report child")
+    eq(online_checks, 0, "waiting avoids even the connectivity check")
+    eq(position_checks, 0, "waiting avoids position preparation")
+    eq(report:status().state, "waiting_for_download", "waiting state")
+    eq(report:status().failure_count, 0, "waiting does not count as a failure")
+    eq(report:status().consecutive_failures, 0, "waiting does not consume retry budget")
+    downloading = false
+    scheduled[13].callback()
+    eq(spawned, 1, "next tick resumes once the download ends")
+    eq(online_checks, 1, "connectivity checked only after resuming")
+    eq(position_checks, 1, "fresh position prepared after resuming")
+end)
+
+test("stopping a deferred report invalidates its pending tick", function()
+    local downloading, spawned = true, 0
+    local report, _, scheduled = fixture(nil, {
+        is_downloading = function() return downloading end,
+    })
+    report._start_job = function() spawned = spawned + 1; return true end
+    report:start("fixture")
+    scheduled[1].callback()
+    report:stop("document_closed")
+    downloading = false
+    scheduled[2].callback()
+    eq(spawned, 0, "stale waiting tick cannot restart a stopped report")
+    eq(report:status().running, false, "report stays stopped")
+end)
+
+test("explicit position uploads keep their existing admission behavior", function()
+    local attempts = 0
+    local report = fixture(nil, { is_downloading = function() return true end })
+    report._run_pipeline = function()
+        attempts = attempts + 1
+        return { accepted = true }
+    end
+    eq(report:upload_position("book", { chapter_uid = 22 }, 0), true,
+        "explicit upload bypasses only the scheduled-report download gate")
+    eq(attempts, 1, "explicit upload still invokes the existing pipeline")
 end)
 
 test("one reader session enters once and reports live position", function()

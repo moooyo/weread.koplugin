@@ -52,7 +52,19 @@ local function clean_quote(value)
     return text
 end
 
-local function review_for_range(reviews, range)
+function ExternalAnnotations.build_review_lookup(reviews)
+    local lookup = {}
+    for _, review in ipairs(type(reviews) == "table" and reviews or {}) do
+        if type(review) == "table" then
+            local range = tostring(review.range or "")
+            if lookup[range] == nil then lookup[range] = review end
+        end
+    end
+    return lookup
+end
+
+local function review_for_range(reviews, range, lookup)
+    if lookup then return lookup[range] end
     for _, review in ipairs(type(reviews) == "table" and reviews or {}) do
         if type(review) == "table" and tostring(review.range or "") == range then
             return review
@@ -60,13 +72,14 @@ local function review_for_range(reviews, range)
     end
 end
 
-function ExternalAnnotations.quote_for(underline, reviews)
+-- A caller processing many ranges can reuse build_review_lookup(reviews).
+function ExternalAnnotations.quote_for(underline, reviews, review_by_range)
     if type(underline) ~= "table" then return "" end
     for _, key in ipairs({ "markText", "bookmarkText", "rangeText", "abstract", "text" }) do
         local quote = clean_quote(underline[key])
         if quote ~= "" then return quote end
     end
-    local review = review_for_range(reviews, tostring(underline.range or ""))
+    local review = review_for_range(reviews, tostring(underline.range or ""), review_by_range)
     local page = review and type(review.pageReviews) == "table"
         and review.pageReviews[1] or nil
     local item = page and (page.review or page) or nil
@@ -403,12 +416,15 @@ end
 --   chapter_ranges      uid -> { start_xpointer, end_xpointer, title }
 --   chapter_titles      uid -> WeRead catalog title (for perf logs)
 --   chapter_local_titles uid -> matched local TOC title (for perf logs)
+--   include_items       false omits popup items from position records
+--   incremental_checkpoint true emits only records added since the last checkpoint
 -- The caller is responsible for downloading the data; this function never
 -- touches the network and never moves the reading position.
 function ExternalAnnotations.locate(document, chapters, options)
     assert(type(document) == "table", "document is required")
     options = options or {}
     local records = options.resume and options.resume.records or {}
+    local checkpoint_start = #records + 1
     local stats = options.resume and options.resume.stats or { total = 0, located = 0, missing_text = 0, unmatched = 0, partial = 0 }
     pos_elapsed = 0
     -- Whole-locate cursor for books without chapter ranges, so repeated
@@ -427,6 +443,7 @@ function ExternalAnnotations.locate(document, chapters, options)
             and tostring(options.chapter_titles[uid] or "") or ""
         local local_title = type(options.chapter_local_titles) == "table"
             and tostring(options.chapter_local_titles[uid] or "") or ""
+        local review_by_range = ExternalAnnotations.build_review_lookup(chapter.reviews)
 
         local underlines = {}
         for _, row in ipairs(type(chapter.underlines) == "table" and chapter.underlines or {}) do
@@ -473,7 +490,7 @@ function ExternalAnnotations.locate(document, chapters, options)
             for seq, underline in ipairs(underlines) do
                 if seq >= (options.resume and options.resume.next_index or 1) then
                     local after = scan_range ~= nil and range_start(underline) > scan_range
-                    local quote = ExternalAnnotations.quote_for(underline, chapter.reviews)
+                    local quote = ExternalAnnotations.quote_for(underline, chapter.reviews, review_by_range)
                     local first, last = ExternalAnnotations.find_in_flat(flat, quote,
                         scan_cursor + (after and 1 or 0))
                     if first then
@@ -481,6 +498,7 @@ function ExternalAnnotations.locate(document, chapters, options)
                         scan_cursor = first
                     end
                     scan_range = range_start(underline)
+                    if options.yield and seq % 16 == 0 then options.yield() end
                 end
             end
         end
@@ -517,6 +535,7 @@ function ExternalAnnotations.locate(document, chapters, options)
             end
             -- 3. Whole-book fallback.  The result is still range-filtered so
             -- out-of-chapter hits are never projected onto this chapter.
+            if options.yield then options.yield() end
             local results = search_all(document, quote)
             local filtered = {}
             for _, candidate in ipairs(results) do
@@ -539,7 +558,7 @@ function ExternalAnnotations.locate(document, chapters, options)
 
             local quote_started = os.clock()
             local underline_range = tostring(underline.range or "")
-            local quote = ExternalAnnotations.quote_for(underline, chapter.reviews)
+            local quote = ExternalAnnotations.quote_for(underline, chapter.reviews, review_by_range)
             if quote == "" then
                 stats.missing_text = stats.missing_text + 1
                 perf("book_id=", book_id, "chapter_uid=", uid, "seq=", seq,
@@ -549,7 +568,11 @@ function ExternalAnnotations.locate(document, chapters, options)
                 local result, partial, mode, hits = locate_quote(quote)
                 if result then
                     global_cursor_xp = result.start
-                    local review = review_for_range(chapter.reviews, underline_range)
+                    local items
+                    if options.include_items ~= false then
+                        local review = review_by_range[underline_range]
+                        items = review and Annotations.buildThoughtPopupItems(review) or {}
+                    end
                     records[#records + 1] = {
                         id = table.concat({ book_id, uid, underline_range }, ":"),
                         pos0 = result.start,
@@ -558,7 +581,7 @@ function ExternalAnnotations.locate(document, chapters, options)
                         book_id = book_id,
                         chapter_uid = uid,
                         range = underline_range,
-                        items = review and Annotations.buildThoughtPopupItems(review) or {},
+                        items = items,
                         partial = partial or nil,
                     }
                     stats.located = stats.located + 1
@@ -574,9 +597,18 @@ function ExternalAnnotations.locate(document, chapters, options)
             end
             previous_range = range_start(underline)
             if options.checkpoint and (seq % 16 == 0 or seq == #underlines) then
-                options.checkpoint({ records = records, stats = stats,
+                local saved_records, saved_stats = records, stats
+                if options.incremental_checkpoint then
+                    saved_records, saved_stats = {}, {}
+                    for index = checkpoint_start, #records do
+                        saved_records[#saved_records + 1] = records[index]
+                    end
+                    for key, value in pairs(stats) do saved_stats[key] = value end
+                end
+                options.checkpoint({ records = saved_records, stats = saved_stats,
                     next_index = seq + 1, cursor_xp = search_origin,
                     cursor_byte = cursor_byte, previous_range = previous_range })
+                checkpoint_start = #records + 1
             end
             if options.yield and (seq % 16 == 0 or seq == #underlines) then
                 options.yield(seq, #underlines, stats)
