@@ -1,0 +1,2 @@
+*.sh text eol=lf
+CHANGELOG.md text eol=lf

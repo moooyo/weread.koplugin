@@ -8,7 +8,7 @@
 
 > ⚠️ 建议使用 **KOReader 2026.03 或更高版本**。旧版本可能无法正常加载或使用插件，例如「工具」菜单中找不到「微信读书」。详见 [#14](https://github.com/finlater/weread.koplugin/issues/14)。
 
-1. 前往 [GitHub Releases](https://github.com/finlater/weread.koplugin/releases) 下载最新的 `weread.koplugin-vX.Y.Z.zip` 安装包。
+1. Download the latest `weread.koplugin-vX.Y.Z.zip` package from [GitHub Releases](https://github.com/moooyo/weread.koplugin/releases).
 2. 解压安装包，得到 `weread.koplugin` 文件夹。
 3. 将该文件夹复制到 KOReader 的 `plugins` 目录：
 

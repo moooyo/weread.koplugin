@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [1.5.0]
+
+- Add configurable parallel chapter downloads, with five concurrent chapters by default and a selectable range of one to five.
+- Preserve completed chapter data after cancellation or network failure so the next download resumes without fetching successful chapters again.
+- Retry temporary download failures up to two times, then pause persistent network failures with clear recovery instructions.
+- Improve caching and annotation processing for large books, and defer automatic reading synchronization while manual downloads are active.
+- Improve EPUB assembly and image recovery, and keep cancellation responsive while background tasks finish or are terminated.
+- Refresh the book's cached chapter count and Read action immediately after a successful download.
+- Use this repository's GitHub Releases for plugin update checks and downloads.
+
 ## [1.4.2]
 
 - 优化划线和想法的拉取速度与进度显示，减少网络请求。
